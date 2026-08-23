@@ -906,6 +906,40 @@ az.plot_compare(comparison, figsize=(7, 3))
 plt.show()
 ```
 
+PSIS-LOO is an importance-sampling approximation, and it can fail silently. Two
+things say whether the numbers above mean anything: the Pareto shape $k$ for
+each observation (above ~0.7 the importance weights have infinite variance) and
+`p_loo`, the effective number of parameters. `p_loo` exceeding the number of
+observations is not a large model — it is a broken estimate, and it usually
+signals a handful of observations with extreme fitted values, which is exactly
+what a spline can produce near its boundary knots where the data thin out.
+
+```{python}
+#| label: py-loo-reliability
+def loo_reliability(idata, name):
+    loo = az.loo(idata, pointwise=True)
+    k = np.asarray(loo.pareto_k)
+    n = k.size
+    bad = int((k > 0.7).sum())
+    reliable = (loo.p_loo < n / 2) and (bad / n <= 0.05)
+    print(f"{name:<10} elpd={float(loo.elpd_loo):>10.1f}  p_loo={float(loo.p_loo):>9.1f}"
+          f"  (n={n})  k>0.7: {bad:>4} ({100 * bad / n:4.1f}%)  max k={k.max():.2f}"
+          f"  -> {'ok' if reliable else 'UNRELIABLE'}")
+    return reliable
+
+LOO_RELIABLE = {
+    "M1 linear": loo_reliability(idata1, "M1 linear"),
+    "M2 spline": loo_reliability(idata2, "M2 spline"),
+}
+LOO_TRUSTWORTHY = all(LOO_RELIABLE.values())
+if not LOO_TRUSTWORTHY:
+    print("\nLOO cannot rank these models. That does not block the analysis --"
+          "\nthe selection criterion is out-of-sample R^2 / MSE on run value --"
+          "\nbut the elpd column above should not be quoted. If the unreliable"
+          "\nmodel is the spline, reducing SPLINE_DF or tightening the spline"
+          "\nprior usually tames the boundary behaviour that causes it.")
+```
+
 LOO measures out-of-sample density for the *whiff* response. It is a useful fit
 check, but it is not the criterion asked for — that is run value, below.
 
@@ -1151,7 +1185,11 @@ else:
     print(f"\n{leader} leads by {margin:.4f} R^2.")
 
 print(f"SELECTED: {SELECTED}")
-print(f"LOO preference (whiff fit, for reference): {comparison.index[0]}")
+if LOO_TRUSTWORTHY:
+    print(f"LOO preference (whiff fit, for reference): {comparison.index[0]}")
+else:
+    unreliable = [k for k, v in LOO_RELIABLE.items() if not v]
+    print(f"LOO withheld: unreliable for {unreliable} (see the Pareto-k check)")
 
 best_stuff = stuff1 if SELECTED.startswith("M1") else stuff2
 gain = candidates.loc[SELECTED, "cv_r2"] - results.loc[BASELINE, "cv_r2"]
