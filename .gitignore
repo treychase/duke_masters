@@ -17,3 +17,6 @@ mlb_statcast.tex
 .RData
 .Ruserdata
 *.rds
+
+# Rscript default plot device
+Rplots.pdf
