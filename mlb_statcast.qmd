@@ -834,7 +834,14 @@ print(f2)
 # explicitly regularizing prior and pin the intercept and group-level scale to
 # match M1 -- otherwise M2 wins or loses the comparison on prior width rather
 # than on functional form.
-priors2 = {t: bmb.Prior("Normal", mu=0, sigma=1.5)
+# Exposed as a named constant because it is a live tuning knob, not a detail:
+# on the synthetic check, dropping it from 1.5 to 0.5 cut the share of failing
+# Pareto-k values from 95% to 46%. It is left at the weaker setting so the
+# comparison is not quietly decided by prior strength, but tighten it if the
+# reliability check below fires on real data.
+SPLINE_PRIOR_SIGMA = 1.5
+
+priors2 = {t: bmb.Prior("Normal", mu=0, sigma=SPLINE_PRIOR_SIGMA)
            for t in spline_terms if t.startswith("bs(")}
 priors2["Intercept"] = bmb.Prior("Normal", mu=0, sigma=2.5)
 priors2["1|pitch_name"] = bmb.Prior(
@@ -906,13 +913,39 @@ az.plot_compare(comparison, figsize=(7, 3))
 plt.show()
 ```
 
-PSIS-LOO is an importance-sampling approximation, and it can fail silently. Two
-things say whether the numbers above mean anything: the Pareto shape $k$ for
-each observation (above ~0.7 the importance weights have infinite variance) and
+PSIS-LOO is an importance-sampling approximation and it can fail silently. Two
+quantities say whether the numbers above mean anything: the Pareto shape $k$ per
+observation (above ~0.7 the importance weights have infinite variance) and
 `p_loo`, the effective number of parameters. `p_loo` exceeding the number of
-observations is not a large model — it is a broken estimate, and it usually
-signals a handful of observations with extreme fitted values, which is exactly
-what a spline can produce near its boundary knots where the data thin out.
+observations is not a large model — it is a broken estimate.
+
+The usual cause is a handful of highly influential points. That is *not* what
+happens to the spline model here, and the distinction matters, so it was
+measured rather than assumed (`validation/probe_spline_loo.py`):
+
+| spline settings | `p_loo` (n = 2021) | share $k > 0.7$ | max $k$ |
+|---|---|---|---|
+| `df=4`, $\sigma = 1.5$ (default) | 14566 | 95.4% | 6.40 |
+| `df=3`, $\sigma = 1.5$ | 6598 | 71.8% | 4.92 |
+| `df=4`, $\sigma = 0.5$ | 2796 | 45.5% | 2.81 |
+| `df=4`, $\sigma = 1.5$, 5× draws | 16815 | 96.4% | 6.19 |
+
+Nearly every observation fails, not a few, so this is a property of the model
+rather than of some outliers. Five times the draws makes it marginally *worse*,
+which rules out a short chain. Regularization — a smaller basis, and especially
+a tighter prior on the spline coefficients — improves it monotonically but does
+not rescue it at any setting tried.
+
+The reading consistent with all four rows is that the spline coefficients are
+only weakly identified: the posterior *mean* prediction is fine (the curvature
+test below is satisfied, and the run-value fit is marginally better than M1's),
+but individual draws produce predictions poor enough that the leave-one-out
+importance weights degenerate. When PSIS breaks down like this the fix is not to
+tune the model until the diagnostic stops complaining — that selects on the
+diagnostic rather than on predictive accuracy — it is to use $K$-fold
+cross-validation, which refits and needs no importance weights. Nothing here
+depends on it: the selection criterion is out-of-sample $R^2$ / MSE on run
+value, and that is a $K$-fold estimate already.
 
 ```{python}
 #| label: py-loo-reliability
@@ -933,11 +966,13 @@ LOO_RELIABLE = {
 }
 LOO_TRUSTWORTHY = all(LOO_RELIABLE.values())
 if not LOO_TRUSTWORTHY:
-    print("\nLOO cannot rank these models. That does not block the analysis --"
-          "\nthe selection criterion is out-of-sample R^2 / MSE on run value --"
-          "\nbut the elpd column above should not be quoted. If the unreliable"
-          "\nmodel is the spline, reducing SPLINE_DF or tightening the spline"
-          "\nprior usually tames the boundary behaviour that causes it.")
+    print("\nLOO cannot rank these models, and the elpd column above should not"
+          "\nbe quoted. Regularizing the spline (smaller SPLINE_DF, smaller"
+          "\nSPLINE_PRIOR_SIGMA) reduces the failure but was not enough to fix it"
+          "\non the synthetic check, and more draws did not help -- see the table"
+          "\nabove. The comparison that does not depend on importance weights is"
+          "\nthe grouped K-fold run-value evaluation below, which is the stated"
+          "\nselection criterion anyway.")
 ```
 
 LOO measures out-of-sample density for the *whiff* response. It is a useful fit
