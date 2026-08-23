@@ -278,6 +278,7 @@ SUMMARY_PATH
 
 ```{python}
 #| label: py-setup
+import re
 import warnings
 
 import arviz as az
@@ -565,7 +566,11 @@ distribution).
 ```{python}
 #| label: py-diagnostics
 def mcmc_report(idata, name):
-    s = az.summary(idata)
+    # omit_offsets=False keeps the unconstrained `*_log__` copies in the
+    # posterior. They are deterministic transforms of parameters already listed,
+    # so counting them would double-count and clutter the worst-mixing table.
+    sampled = [v for v in idata.posterior.data_vars if not v.endswith("__")]
+    s = az.summary(idata, var_names=sampled)
     div = int(idata.sample_stats["diverging"].sum())
     n_draws = idata.posterior.sizes["chain"] * idata.posterior.sizes["draw"]
     bfmi = az.bfmi(idata)
@@ -837,6 +842,20 @@ priors2["1|pitch_name"] = bmb.Prior(
 )
 
 m2 = bmb.Model(f2, model_df, family="beta_binomial", priors=priors2)
+
+# nutpie hands its results to arviz through arrow, and that conversion splits
+# variable names on commas -- so a term named "bs(avg_release_speed, df=4)"
+# produces the dim name " df=4)_dim" and the fit dies with
+# KeyError: ' df=4)_dim'. Aliasing the spline terms to comma-free names avoids
+# it entirely and reads better in the summaries. Priors are keyed on the real
+# term names, not the aliases, so `priors2` above is unaffected.
+SPLINE_ALIAS = {
+    t: "s_" + re.match(r"bs\((\w+),", t).group(1)
+    for t in spline_terms if t.startswith("bs(")
+}
+print("aliases:", SPLINE_ALIAS)
+m2.set_alias(SPLINE_ALIAS)
+
 m2.build()
 print(m2)
 ```
@@ -846,6 +865,8 @@ print(m2)
 idata2 = m2.fit(**SAMPLE_KW)
 ensure_log_likelihood(m2, idata2)
 rep2, worst2 = mcmc_report(idata2, "M2 spline")
+print(az.summary(idata2, var_names=list(SPLINE_ALIAS.values())).round(3).to_string())
+print()
 print(pd.concat([rep1, rep2], axis=1).to_string())
 print("\nworst-mixing parameters (M2):")
 print(worst2.round(3).to_string())
