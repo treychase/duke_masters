@@ -49,14 +49,17 @@ for (i in seq_along(chunks)) {
     cat(">> STUB: reading synthetic_statcast.csv instead of scraping\n")
   }
 
-  res <- try(eval(parse(text = paste(code, collapse = "\n")), envir = env),
-             silent = TRUE)
+  # withVisible() so a chunk ending in print() or assignment is not echoed a
+  # second time -- this is what knitr does, and without it every table that the
+  # notebook prints explicitly appears twice.
+  res <- try(withVisible(eval(parse(text = paste(code, collapse = "\n")),
+                              envir = env)), silent = TRUE)
   if (inherits(res, "try-error")) {
     cat("FAILED:\n"); cat(as.character(res), "\n")
     failures <- c(failures, sprintf("[%02d] %s", i - 1L, ch$label))
     break
-  } else if (!is.null(res) && ch$label != "scrape") {
-    if (is.data.frame(res) || is.atomic(res)) try(print(res), silent = TRUE)
+  } else if (res$visible && !is.null(res$value)) {
+    try(print(res$value), silent = TRUE)
   }
 
   if (ch$label == "setup" && FAST) {

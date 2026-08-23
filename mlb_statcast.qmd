@@ -72,6 +72,13 @@ ITER        <- 4000   # includes warmup
 WARMUP      <- 2000
 ADAPT_DELTA <- 0.95
 
+# Hierarchical models with smooths routinely saturate the default tree depth of
+# 10, which is not a validity problem but halves the effective sample size for
+# the money it spends. 12 is cheap insurance; `pct_max_treedepth` below reports
+# whether it was enough.
+MAX_TREEDEPTH <- 12
+CTRL <- list(adapt_delta = ADAPT_DELTA, max_treedepth = MAX_TREEDEPTH)
+
 DATA_DIR <- "data"
 dir.create(DATA_DIR, showWarnings = FALSE, recursive = TRUE)
 ```
@@ -496,7 +503,7 @@ m1 <- brm(
   f1, data = model_df, family = beta_binomial(),
   prior = priors1,
   chains = CHAINS, iter = ITER, warmup = WARMUP,
-  control = list(adapt_delta = ADAPT_DELTA),
+  control = CTRL,
   seed = RANDOM_SEED, refresh = 0
 )
 summary(m1)
@@ -513,8 +520,10 @@ divergent transitions (should be zero), tree-depth saturation, and E-BFMI (below
 ```{r}
 #| label: diagnostics
 mcmc_report <- function(fit, name) {
+  # lp__ and lprior are brms bookkeeping, not parameters; including them
+  # distorts the worst-mixing table.
   s <- summarise_draws(as_draws_array(fit), "rhat", "ess_bulk", "ess_tail") |>
-    filter(variable != "lp__")
+    filter(!variable %in% c("lp__", "lprior"))
   np <- nuts_params(fit)
   div <- sum(np$Value[np$Parameter == "divergent__"])
   td  <- np$Value[np$Parameter == "treedepth__"]
@@ -530,7 +539,7 @@ mcmc_report <- function(fit, name) {
       min_ess_tail      = round(min(s$ess_tail, na.rm = TRUE)),
       divergences       = div,
       div_pct           = round(100 * div / n_draws, 3),
-      pct_max_treedepth = round(100 * mean(td >= 10), 2),
+      pct_max_treedepth = round(100 * mean(td >= MAX_TREEDEPTH), 2),
       min_bfmi          = round(min(bfmi, na.rm = TRUE), 3)
     ),
     worst = s |> arrange(ess_bulk) |> head(5)
@@ -722,11 +731,17 @@ Where linearity fails, the fix is to keep the hierarchy and the beta-binomial
 likelihood exactly as they are and relax only the *functional form*: replace the
 flagged linear terms with a smooth. `s()` fits a **penalized** thin-plate
 regression spline, with the wiggliness controlled by a smoothing standard
-deviation that Stan estimates alongside everything else. That is preferable to a
-fixed-`df` B-spline basis here: an unpenalized basis has to be given exactly the
-right flexibility up front, and if it is given too much it will chase noise
-between knots, whereas the penalty shrinks unsupported wiggliness toward a
-straight line on its own.
+deviation that Stan estimates alongside everything else.
+
+The penalty is doing real work here, not just tidying the syntax. An earlier
+version of this model used a fixed-`df` B-spline basis, which has to be given
+exactly the right flexibility up front; given too much it chases noise between
+knots. The resulting posterior was diffuse enough that its per-draw predictions
+were far worse than its posterior mean, PSIS-LOO degenerated completely
+(`p_loo` of 14302 against 2021 observations, with 98% of Pareto $k$ above 0.7),
+and no amount of shrinking the basis or tightening the prior rescued it.
+Estimating the penalty instead of fixing the basis width removes the problem at
+source: the LOO reliability check below passes for both models.
 
 The group-specific terms stay linear. Per-pitch-type smooths would add a
 smoothing parameter and basis per pitch type, and with a few dozen pitchers in
@@ -766,7 +781,7 @@ m2 <- brm(
   f2, data = model_df, family = beta_binomial(),
   prior = priors2,
   chains = CHAINS, iter = ITER, warmup = WARMUP,
-  control = list(adapt_delta = ADAPT_DELTA),
+  control = CTRL,
   seed = RANDOM_SEED, refresh = 0
 )
 summary(m2)
@@ -869,18 +884,28 @@ rate at that type's own average mechanics.
 
 ```{r}
 #| label: forest-slopes
-FOCUS <- "avg_release_speed"
+# Pick a mechanic that survived the VIF screen -- avg_release_speed normally
+# does, but do not assume it.
+FOCUS <- if ("avg_release_speed" %in% PRED_VARS) "avg_release_speed" else PRED_VARS[1]
 
 # The group-level deviations r_pitch_name[type, term] are offsets from the
 # population slope b_<term>; adding them back gives each type's own slope.
-slope_draws <- as_draws_df(m2) |>
+# M2 replaces the flagged population terms with smooths, so `b_<term>` exists
+# only for terms that stayed linear. The *group-level* slopes are linear in both
+# models, so this plot reads M1, where the population slope is always defined.
+slope_fit <- m1
+
+slope_draws <- as_draws_df(slope_fit) |>
   select(matches(sprintf("^b_%s$|^r_pitch_name\\[.*,%s\\]$", FOCUS, FOCUS)))
 pop <- slope_draws[[paste0("b_", FOCUS)]]
 
 type_slopes <- slope_draws |>
   select(-all_of(paste0("b_", FOCUS))) |>
   imap_dfr(~ tibble(
-    pitch_name = sub(sprintf("^r_pitch_name\\[(.*),%s\\]$", FOCUS), "\\1", .y),
+    # brms turns factor levels into parameter names, so spaces arrive as dots
+    # ("4-Seam.Fastball"). Put them back for the axis labels.
+    pitch_name = gsub(".", " ", fixed = TRUE,
+                      sub(sprintf("^r_pitch_name\\[(.*),%s\\]$", FOCUS), "\\1", .y)),
     slope = .x + pop
   ))
 
