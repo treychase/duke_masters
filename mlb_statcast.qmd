@@ -1274,10 +1274,11 @@ print(f"selected model: {SELECTED}")
 | Stage | Result |
 |---|---|
 | Missing data | `arm_angle` is absent for some pitchers entirely; incomplete rows dropped explicitly before standardizing |
-| Collinearity | VIF pruning at threshold 5 — `arm_angle` is near-deterministic in release position |
+| Collinearity | VIF measured *within* pitch type (the varying intercept absorbs between-type differences), pruned at 5 — `arm_angle` is near-deterministic in release position |
 | Overdispersion | Beta-binomial over binomial, `kappa` estimated |
 | Hierarchy | Varying intercept + slopes by `pitch_name`; each type gets its own posterior |
-| Linearity | Tested by binned residuals + weighted curvature tests; splines fitted where it fails |
-| MCMC | $\hat{R}$, ESS bulk/tail, divergences, tree depth, E-BFMI, energy plot, PPC |
+| Linearity | Binned residuals + weighted curvature tests + global RESET; B-splines fitted on the terms that fail |
+| MCMC | $\hat{R}$, ESS bulk/tail, divergences, tree depth, E-BFMI, energy plot, PPC on count and rate scales |
+| Fit comparison | LOO, gated on a Pareto-$k$ reliability check and withheld when PSIS degenerates |
 | Stuff+ | Draw-wise z-score against the pitch type's own posterior, 100 ± 10 |
 | Selection | Grouped 5-fold CV $R^2$ / MSE on cumulative run value, with exposure in the baseline |
