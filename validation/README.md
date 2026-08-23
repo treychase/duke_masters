@@ -14,7 +14,9 @@ end-to-end anyway.
   deliberate quadratic in velocity and in vertical break, so the linearity tests
   have something real to find. **The numbers carry no baseball meaning.**
 - `build_summary.R` — mirror of the notebook's aggregation chunk, producing a
-  `data/pitcher_summary.csv` for the Stan probes.
+  `data/pitcher_summary.csv`. Not needed by `run_chunks.R`, which builds the
+  same table by running the notebook's own aggregation; useful for poking at a
+  model outside the notebook.
 - `run_chunks.R` — extracts every ```` ```{r} ```` chunk from the notebook in
   order and evaluates them in one environment.
 
@@ -22,7 +24,7 @@ end-to-end anyway.
 
 ```bash
 Rscript make_synthetic_statcast.R
-Rscript build_summary.R          # optional; only the probes need it
+Rscript build_summary.R          # optional
 Rscript run_chunks.R ../mlb_statcast.qmd
 ```
 
