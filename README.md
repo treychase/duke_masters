@@ -45,6 +45,11 @@ reloads them instead of refitting. `file_refit = "on_change"` watches the
 formula, data, prior and family — **not** the sampler settings, so delete
 `fits/` after changing `CHAINS`/`ITER`/`WARMUP`.
 
+Saved fits are large — at the harness's reduced settings they came out at 35 MB
+and 64 MB, and the notebook's full 4 chains × 2000 post-warmup draws are
+considerably bigger. `fits/` is gitignored; delete it whenever you want the disk
+back, at the cost of a refit.
+
 If a fit ever fails, note that `brm()` does not raise: rstan warns and returns a
 fit with no draws, which then surfaces later as
 `Error: The model does not contain posterior draws.` The notebook checks for
