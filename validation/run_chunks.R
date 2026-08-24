@@ -29,6 +29,10 @@ chunks <- lapply(starts, function(s) {
 })
 cat(sprintf("extracted %d R chunks\n", length(chunks)))
 
+# Sampler settings are overridden below, and brms's file_refit="on_change" does
+# not notice those, so clear any saved fits first.
+unlink("fits", recursive = TRUE)
+
 env <- new.env(parent = globalenv())
 failures <- character(0)
 
