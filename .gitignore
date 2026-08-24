@@ -20,3 +20,6 @@ mlb_statcast.tex
 
 # Rscript default plot device
 Rplots.pdf
+
+# brms saved fits
+fits/

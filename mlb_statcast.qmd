@@ -79,6 +79,36 @@ ADAPT_DELTA <- 0.95
 MAX_TREEDEPTH <- 12
 CTRL <- list(adapt_delta = ADAPT_DELTA, max_treedepth = MAX_TREEDEPTH)
 
+# Fits are persisted with brms's own `file=` argument rather than by caching the
+# chunk. Two reasons. knitr's cache is an opaque database keyed on chunk text,
+# so there is nothing obvious to delete when it holds something bad; and `brm()`
+# does not raise when sampling fails -- rstan warns and returns a fit whose
+# `sim` slot is empty -- so a failed fit gets stored like any other, and every
+# later render reloads it without re-running Stan, by which point the warnings
+# that explained the failure are gone.
+# Note that `file_refit = "on_change"` watches the formula, data, prior and
+# family -- not the sampler arguments. Changing CHAINS/ITER/WARMUP/CTRL will
+# NOT trigger a refit; delete fits/ when you want those to take effect.
+FIT_DIR <- "fits"
+dir.create(FIT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+check_draws <- function(fit, path) {
+  if (length(fit$fit@sim)) return(invisible(fit))
+  rds <- paste0(path, ".rds")
+  removed <- if (file.exists(rds)) {
+    unlink(rds)
+    sprintf(" Removed %s so a re-run refits.", rds)
+  } else ""
+  stop(sprintf(
+    paste0("`%s` came back with no posterior draws. That means every chain ",
+           "failed, not that the model is misspecified. Stan reports the reason ",
+           "as *warnings*, so the real message is above this one. Usual causes: ",
+           "a C++ toolchain that compiles but cannot run; a row with n_whiffs > ",
+           "n_swings; a predictor left constant after standardization, which ",
+           "makes scale() return NaN; or an interrupted run.%s"),
+    basename(path), removed), call. = FALSE)
+}
+
 DATA_DIR <- "data"
 dir.create(DATA_DIR, showWarnings = FALSE, recursive = TRUE)
 ```
@@ -498,14 +528,18 @@ priors1 <- c(
 
 ```{r}
 #| label: m1-fit
-#| cache: true
 m1 <- brm(
   f1, data = model_df, family = beta_binomial(),
   prior = priors1,
   chains = CHAINS, iter = ITER, warmup = WARMUP,
   control = CTRL,
-  seed = RANDOM_SEED, refresh = 0
+  seed = RANDOM_SEED, refresh = 0,
+  file = file.path(FIT_DIR, "m1"), file_refit = "on_change"
 )
+# Before summary(): on a draw-less fit summary() prints "The model does not
+# contain posterior draws." as part of its output rather than raising, so the
+# run would otherwise continue and fail somewhere less informative.
+check_draws(m1, file.path(FIT_DIR, "m1"))
 summary(m1)
 ```
 
@@ -776,14 +810,18 @@ priors2 <- c(
 
 ```{r}
 #| label: m2-fit
-#| cache: true
 m2 <- brm(
   f2, data = model_df, family = beta_binomial(),
   prior = priors2,
   chains = CHAINS, iter = ITER, warmup = WARMUP,
   control = CTRL,
-  seed = RANDOM_SEED, refresh = 0
+  seed = RANDOM_SEED, refresh = 0,
+  file = file.path(FIT_DIR, "m2"), file_refit = "on_change"
 )
+# Before summary(): on a draw-less fit summary() prints "The model does not
+# contain posterior draws." as part of its output rather than raising, so the
+# run would otherwise continue and fail somewhere less informative.
+check_draws(m2, file.path(FIT_DIR, "m2"))
 summary(m2)
 ```
 

@@ -40,8 +40,16 @@ install.packages(c("baseballr", "tidyverse", "brms", "posterior",
 to compile before sampling starts — `rstan::rstan_options(auto_write = TRUE)`
 caches the compiled binaries between runs.
 
-The two `brm()` chunks are marked `#| cache: true`, so re-rendering the document
-does not refit them unless the data or the formula changes.
+Both fits are saved under `fits/` via brms's `file=` argument, so re-rendering
+reloads them instead of refitting. `file_refit = "on_change"` watches the
+formula, data, prior and family — **not** the sampler settings, so delete
+`fits/` after changing `CHAINS`/`ITER`/`WARMUP`.
+
+If a fit ever fails, note that `brm()` does not raise: rstan warns and returns a
+fit with no draws, which then surfaces later as
+`Error: The model does not contain posterior draws.` The notebook checks for
+this right after each fit, reports it there, and deletes the saved fit so the
+next run refits rather than reloading the broken one.
 
 ## validation/
 
