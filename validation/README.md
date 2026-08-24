@@ -1,44 +1,49 @@
 # validation/
 
-Offline harness for the Python half of `mlb_statcast.qmd`. Not part of the
-analysis — nothing here is imported by the notebook.
+Offline harness for `mlb_statcast.qmd`. Not part of the analysis — nothing here
+is sourced by the notebook.
 
 Baseball Savant is not reachable from every environment (CI, sandboxes, an
-airplane). This directory makes it possible to check that the modelling code
-runs end-to-end anyway.
+airplane). This directory makes it possible to check that the notebook runs
+end-to-end anyway.
 
 ## Files
 
-- `make_synthetic_statcast.py` — generates a pitch-level frame with Statcast's
-  column names, units, and missingness patterns. The response is simulated with
-  a deliberate quadratic in velocity and in vertical break so the linearity
-  tests have something real to find. **The numbers carry no baseball meaning.**
-- `build_summary.py` — Python mirror of the notebook's R aggregation chunk,
-  producing a `pitcher_summary.csv` of the same shape.
-- `run_chunks.py` — extracts every ```` ```{python} ```` chunk from the notebook
-  in order and executes them in one namespace.
-- `run_r_chunks.R` — extracts the notebook's R cleaning/aggregation chunks,
-  runs them on the same synthetic frame, and asserts the result matches
-  `build_summary.py` row for row. This is what checks the dedupe key, the
-  left-hander mirroring, the swing/whiff classification and the run-value
-  summation. (The generator does not emit `game_pk` / `at_bat_number` /
-  `pitch_number`, so the harness synthesizes them.)
+- `make_synthetic_statcast.R` — generates a pitch-level frame with Statcast's
+  column names, units and missingness patterns. Quality is simulated with a
+  deliberate quadratic in velocity and in vertical break, so the linearity tests
+  have something real to find. **The numbers carry no baseball meaning.**
+- `build_summary.R` — mirror of the notebook's aggregation chunk, producing a
+  `data/pitcher_summary.csv`. Not needed by `run_chunks.R`, which builds the
+  same table by running the notebook's own aggregation; useful for poking at a
+  model outside the notebook.
+- `run_chunks.R` — extracts every ```` ```{r} ```` chunk from the notebook in
+  order and evaluates them in one environment.
 
 ## Running
 
 ```bash
-python make_synthetic_statcast.py
-python build_summary.py
-mkdir -p data && cp pitcher_summary.csv data/
-python run_chunks.py ../mlb_statcast.qmd
-
-# R half (needs dplyr, tidyr, readr, purrr)
-Rscript run_r_chunks.R
+Rscript make_synthetic_statcast.R
+Rscript build_summary.R          # optional
+Rscript run_chunks.R ../mlb_statcast.qmd
 ```
 
-`run_chunks.py` overrides exactly one thing — `SAMPLE_KW` is shrunk to
-`draws=200, tune=300, chains=2` so the two MCMC fits finish in minutes. Set
-`FAST=0` to run at the notebook's real settings. Every other line executes as
-written.
+`run_chunks.R` stubs three things: `library(baseballr)` is dropped (its only use is the scrape), the `scrape` chunk reads
+`synthetic_statcast.csv` instead of calling Baseball Savant, and `CHAINS`/`ITER`/
+`WARMUP` are shrunk so the two Stan fits finish in minutes. Set `FAST=0` to
+sample at the notebook's real settings. Every other line runs as written.
 
 Exit status is 0 when all chunks run, 1 on the first failure.
+
+## Note on Stan
+
+`rstan` needs Boost headers. On Debian/Ubuntu the `r-cran-bh` package is a stub
+that relies on system Boost, and `rstan` then fails with
+`Boost not found; call install.packages('BH')`. Point it at the system headers:
+
+```bash
+ln -sfn /usr/include /usr/lib/R/site-library/BH/include
+```
+
+`rstan::rstan_options(auto_write = TRUE)` caches compiled models and is worth
+setting; each model otherwise recompiles from scratch (1–3 minutes).

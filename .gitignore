@@ -7,20 +7,16 @@ mlb_statcast.tex
 # Scraped and derived data
 /data/
 /validation/data/
-/validation/*.csv
+/validation/synthetic_statcast.csv
 /validation/*.log
+/validation/*.rds
 
 # R
 .Rproj.user
 .Rhistory
 .RData
 .Ruserdata
+*.rds
 
-# Python
-__pycache__/
-*.pyc
-.ipynb_checkpoints/
-
-# validation/ generated artifacts
-/validation/r_out/
-/validation/r_chunks_extracted.R
+# Rscript default plot device
+Rplots.pdf

@@ -13,19 +13,20 @@ editor: visual
 # Overview
 
 This notebook builds a **Stuff+** metric for individual pitches from Statcast
-data. The structure is:
+data. Everything is in R: the scrape and reduction with `baseballr` and the
+tidyverse, the Bayesian models with `brms` on top of Stan.
 
 1.  Scrape pitch-level Statcast data and reduce it to a pitcher × pitch-type
     table of average release/movement mechanics, whiff rate, and **cumulative
     run value**.
 2.  Fit a **hierarchical Bayesian beta-binomial model** of whiff propensity on
-    mechanics, with a varying intercept *and* varying slopes by `pitch_name`.
-    Each pitch type therefore gets its own posterior.
+    mechanics, with a varying intercept *and* varying slopes by `pitch_name`,
+    so each pitch type gets its own posterior.
 3.  Define **Stuff+** as the standardized z-score of a pitcher's posterior
     latent whiff propensity relative to the posterior for *his own pitch type*,
     on the conventional 100 ± 10 scale.
 4.  **Test the linearity assumption** of the logit-linear predictor. Where it
-    fails, do targeted EDA and fit a second MCMC model with spline bases.
+    fails, do targeted EDA and fit a second MCMC model with penalized splines.
 5.  Run full MCMC diagnostics, then **select the model by out-of-sample
     $R^2$ and MSE against cumulative run value**.
 
@@ -36,17 +37,50 @@ data. The structure is:
 
 library(baseballr)
 library(tidyverse)
-library(purrr)
+library(brms)
+library(posterior)
+library(bayesplot)
+library(loo)
+library(splines)
 
 knitr::opts_chunk$set(message = FALSE, warning = FALSE)
 
-# Everything is written relative to the project directory so that the R and
-# Python halves of this notebook read and write the *same* file. (Previously R
-# wrote pitcher_summary.csv to the working directory while Python read a copy
-# from ~/Downloads, so any re-run silently modelled a stale export.)
+options(mc.cores = min(4, parallel::detectCores()))
+
+# brms evaluates the beta-binomial log-likelihood through extraDistr. It is a
+# suggested rather than a hard dependency, so it is easy to have a working brms
+# that samples fine and only fails later at loo(). Worse, when loo() runs in
+# parallel the missing-package error surfaces from the worker as the unrelated
+# "Error in exp(x): non-numeric argument to mathematical function", which sends
+# you looking in the wrong place. Fail early with the real message instead.
+if (!requireNamespace("extraDistr", quietly = TRUE)) {
+  stop("beta_binomial() log-likelihood needs the 'extraDistr' package: ",
+       "install.packages('extraDistr')")
+}
+
+# Compiled Stan binaries are cached, so re-running does not recompile.
+rstan::rstan_options(auto_write = TRUE)
+
+RANDOM_SEED <- 42
+set.seed(RANDOM_SEED)
+
+# One place to change the sampler settings. adapt_delta is raised from the
+# default 0.8 because hierarchical models with varying slopes routinely produce
+# divergent transitions at the default.
+CHAINS      <- 4
+ITER        <- 4000   # includes warmup
+WARMUP      <- 2000
+ADAPT_DELTA <- 0.95
+
+# Hierarchical models with smooths routinely saturate the default tree depth of
+# 10, which is not a validity problem but halves the effective sample size for
+# the money it spends. 12 is cheap insurance; `pct_max_treedepth` below reports
+# whether it was enough.
+MAX_TREEDEPTH <- 12
+CTRL <- list(adapt_delta = ADAPT_DELTA, max_treedepth = MAX_TREEDEPTH)
+
 DATA_DIR <- "data"
 dir.create(DATA_DIR, showWarnings = FALSE, recursive = TRUE)
-SUMMARY_PATH <- file.path(DATA_DIR, "pitcher_summary.csv")
 ```
 
 # Data acquisition
@@ -76,7 +110,8 @@ Three changes relative to a naive `select() |> distinct()`:
 
 **Run value is carried through.** `delta_run_exp` is Statcast's change in run
 expectancy attributable to each pitch (negative = good for the pitcher). It is
-the outcome we ultimately validate against, so it has to survive the reduction.
+the outcome the model is ultimately selected against, so it has to survive the
+reduction.
 
 **De-duplication uses the true pitch key.** `distinct()` over the *value*
 columns silently collapses two genuinely different pitches that happen to share
@@ -85,19 +120,19 @@ identifies a pitch, so dedupe on that instead.
 
 **Horizontal quantities are mirrored for left-handers.** `pfx_x` and
 `release_pos_x` are recorded in the catcher's frame, so a lefty's arm-side run
-carries the opposite sign to a righty's. Averaging the two together — as the
-original pipeline did — pushes group means toward zero and makes the coefficient
-on `avg_pfx_x` close to meaningless. Flipping the sign for LHP puts every pitch
-in a **pitcher-centric** frame: positive `pfx_x` is arm-side, negative is glove-side.
+carries the opposite sign to a righty's. Averaging the two together pushes group
+means toward zero and makes the coefficient on `avg_pfx_x` close to meaningless.
+Flipping the sign for LHP puts every pitch in a **pitcher-centric** frame:
+positive `pfx_x` is arm-side, negative is glove-side.
 
 ```{r}
 #| label: pitch-df
 
 # `arm_angle` was added to the Statcast feed relatively recently; older
 # baseballr versions do not return it and `select()` would abort. Create it as
-# missing instead and let the Python side's missingness report and VIF screen
-# decide what to do with it. `delta_run_exp` is not optional -- it is the
-# model-selection target -- so fail loudly if it is absent.
+# missing instead and let the missingness report and VIF screen decide what to
+# do with it. `delta_run_exp` is not optional -- it is the model-selection
+# target -- so fail loudly if it is absent.
 if (!"arm_angle" %in% names(data)) {
   warning("arm_angle not returned by this baseballr version; filling with NA")
   data$arm_angle <- NA_real_
@@ -208,33 +243,24 @@ pitcher_summary <- pitch_df |>
     n_swings  = sum(is_swing, na.rm = TRUE),
     n_whiffs  = sum(is_whiff, na.rm = TRUE),
     n_pitches = n(),
-    # Cumulative run value: the model-selection target. Negative favours the
-    # pitcher, so it is negated into `run_value_saved` for readability.
     run_value = sum(delta_run_exp, na.rm = TRUE),
     .groups = "drop"
   ) |>
   filter(n_pitches >= 20, n_swings >= 10) |>
   mutate(
-    whiff_rate       = n_whiffs / n_swings,
-    rv_per_100       = 100 * run_value / n_pitches,
-    run_value_saved  = -run_value
+    whiff_rate = n_whiffs / n_swings,
+    rv_per_100 = 100 * run_value / n_pitches
   ) |>
   arrange(pitch_name, player_name)
 
-# `mean(x, na.rm = TRUE)` returns NaN when a group is entirely missing, so a
-# group can clear the n_pitches filter and still carry NaN mechanics. This is
-# exactly what later produced "'data' contains N incomplete rows" in the Python
-# model fit; it is reported here and handled explicitly on the Python side.
-mech_cols <- c(
+MECH_VARS <- c(
   "avg_release_speed", "avg_release_pos_x", "avg_release_pos_z",
   "avg_release_spin_rate", "avg_release_extension", "avg_arm_angle",
   "avg_pfx_x", "avg_pfx_z"
 )
 
-pitcher_summary |>
-  summarise(across(all_of(mech_cols), ~ sum(!is.finite(.x)))) |>
-  pivot_longer(everything(), names_to = "column", values_to = "n_missing") |>
-  arrange(desc(n_missing))
+write_csv(pitcher_summary, file.path(DATA_DIR, "pitcher_summary.csv"))
+nrow(pitcher_summary)
 ```
 
 ```{r}
@@ -256,8 +282,8 @@ ggplot(pitcher_summary, aes(x = whiff_rate)) +
 
 The binomial variance implied by the mean whiff rate is far smaller than the
 observed variance across pitcher-pitch rows, so the counts are **overdispersed**
-relative to a binomial. That is the substantive reason for the `beta_binomial`
-family below rather than plain `binomial`.
+relative to a binomial. That is the substantive reason for `beta_binomial()`
+below rather than `binomial()`.
 
 ```{r}
 #| label: rv-hist
@@ -268,160 +294,75 @@ ggplot(pitcher_summary, aes(x = run_value)) +
   theme_minimal()
 ```
 
+# Data hygiene before modelling
+
+`mean(x, na.rm = TRUE)` returns `NaN` when a group is entirely missing, so a
+pitcher can clear the `n_pitches >= 20` filter and still carry `NaN` mechanics.
+`arm_angle` is the usual culprit — it is a relatively new Statcast field and is
+absent for some pitchers entirely. `brm()` would drop those rows silently; they
+are dropped here explicitly instead, **before** standardizing, so the means and
+standard deviations used to z-score the predictors are computed on exactly the
+rows that get modelled.
+
 ```{r}
-#| label: export
-write_csv(pitcher_summary, SUMMARY_PATH)
-SUMMARY_PATH
-```
+#| label: missingness
 
-# Bayesian model: whiff propensity ~ pitch mechanics
+# NaN and +/-Inf both count as missing here.
+pitcher_summary <- pitcher_summary |>
+  mutate(across(all_of(MECH_VARS), ~ if_else(is.finite(.x), .x, NA_real_)))
 
-```{python}
-#| label: py-setup
-import re
-import warnings
-
-import arviz as az
-import bambi as bmb
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-from scipy.special import logit
-
-warnings.filterwarnings("ignore", category=FutureWarning)
-RANDOM_SEED = 42
-rng = np.random.default_rng(RANDOM_SEED)
-
-# nutpie is a drop-in NUTS implementation that compiles the model; it is several
-# times faster than the default PyMC sampler on models this size. Fall back
-# silently if it is not installed.
-try:
-    import nutpie  # noqa: F401
-    NUTS_SAMPLER = "nutpie"
-except ModuleNotFoundError:
-    NUTS_SAMPLER = "pymc"
-
-SAMPLE_KW = dict(
-    draws=2000,
-    tune=2000,
-    chains=4,
-    target_accept=0.95,
-    random_seed=RANDOM_SEED,
-    # bambi selects the backend with `inference_method=`; passing pm.sample's
-    # own `nuts_sampler=` straight through raises "got multiple values for
-    # keyword argument 'nuts_sampler'".
-    inference_method=NUTS_SAMPLER,
-    idata_kwargs={"log_likelihood": True},
-    # bambi's default `omit_offsets=True` drops the non-centered `*_offset`
-    # variables from the posterior. Those are exactly what the model needs to
-    # reconstruct its group-specific terms, so computing the log-likelihood
-    # afterwards fails with KeyError: '<term>|pitch_name_offset'. Keeping them
-    # costs a little memory and makes LOO possible.
-    omit_offsets=False,
-    progressbar=False,
-)
-print(f"sampler: {NUTS_SAMPLER}")
-
-
-def ensure_log_likelihood(model, idata):
-    """LOO needs a pointwise log-likelihood. nutpie silently ignores
-    `idata_kwargs={"log_likelihood": True}` -- it warns and moves on -- so
-    compute it after the fact when it is missing. Cheap next to sampling."""
-    if "log_likelihood" not in idata.groups():
-        import pymc as pm
-        missing = [v for v in model.backend.model.free_RVs
-                   if v.name not in idata.posterior]
-        if missing:
-            raise RuntimeError(
-                "cannot compute the log-likelihood: "
-                f"{[v.name for v in missing]} are absent from the posterior. "
-                "Fit with omit_offsets=False."
-            )
-        with model.backend.model:
-            pm.compute_log_likelihood(idata, extend_inferencedata=True,
-                                      progressbar=False)
-    return idata
-```
-
-## Loading and data hygiene
-
-The original fit died here:
-
-```
-ValueError: 'data' contains 5 incomplete rows.
-```
-
-`formulae` (the design-matrix backend behind `bambi`) refuses to silently drop
-missing rows. The missingness is real: `arm_angle` is a relatively new Statcast
-field and is absent for some pitchers entirely, and when *every* pitch in a
-group is missing it, `mean(..., na.rm = TRUE)` returns `NaN` rather than
-dropping the group. The `NameError: name 'model' is not defined` that followed
-was purely a cascade — `bmb.Model(...)` raised, so `model` was never bound and
-every downstream chunk failed on the same name.
-
-The fix is to drop the incomplete rows **explicitly and visibly**, before
-standardizing, so that the means and standard deviations used to z-score the
-predictors are computed on exactly the rows that get modelled.
-
-```{python}
-#| label: py-load
-summary_path = "data/pitcher_summary.csv"
-raw = pd.read_csv(summary_path)
-
-MECH_VARS = [
-    "avg_release_speed", "avg_release_pos_x", "avg_release_pos_z",
-    "avg_release_spin_rate", "avg_release_extension", "avg_arm_angle",
-    "avg_pfx_x", "avg_pfx_z",
-]
-
-# `mean(x, na.rm = TRUE)` on an all-missing group yields NaN, which read_csv may
-# parse as either NaN or +/-inf; treat both as missing.
-raw[MECH_VARS] = raw[MECH_VARS].replace([np.inf, -np.inf], np.nan)
-
-missing_report = (
-    raw[MECH_VARS].isna().sum()
-    .rename("n_missing").to_frame()
-    .assign(pct=lambda d: (100 * d.n_missing / len(raw)).round(2))
-    .sort_values("n_missing", ascending=False)
-)
+missing_report <- pitcher_summary |>
+  summarise(across(all_of(MECH_VARS), ~ sum(is.na(.x)))) |>
+  pivot_longer(everything(), names_to = "column", values_to = "n_missing") |>
+  mutate(pct = round(100 * n_missing / nrow(pitcher_summary), 2)) |>
+  arrange(desc(n_missing))
 print(missing_report)
 
-incomplete = raw[MECH_VARS].isna().any(axis=1)
-print(f"\n{incomplete.sum()} of {len(raw)} rows incomplete "
-      f"({100 * incomplete.mean():.2f}%) -> dropped")
-print(raw.loc[incomplete, "pitch_name"].value_counts().to_string())
+incomplete <- pitcher_summary |>
+  filter(if_any(all_of(MECH_VARS), is.na))
+cat(sprintf("\n%d of %d rows incomplete (%.2f%%) -> dropped\n",
+            nrow(incomplete), nrow(pitcher_summary),
+            100 * nrow(incomplete) / nrow(pitcher_summary)))
+print(count(incomplete, pitch_name, sort = TRUE))
 
-df = raw.loc[~incomplete].reset_index(drop=True).copy()
+model_df <- pitcher_summary |> drop_na(all_of(MECH_VARS))
 ```
 
 Because the dropped rows are concentrated in whichever pitch types happen to
 lack `arm_angle` coverage rather than being spread at random, this is
 missing-not-completely-at-random. At well under 2% of rows it is not worth
-imputing, but it *is* worth checking that no pitch type loses a meaningful
-share of its pitchers — the group-level terms below need enough pitchers per
-type to estimate a variance.
+imputing, but it *is* worth checking that no pitch type loses a meaningful share
+of its pitchers — the group-level terms below need enough pitchers per type to
+estimate a variance.
 
-```{python}
-#| label: py-group-sizes
-sizes = (
-    pd.DataFrame({"before": raw.pitch_name.value_counts(),
-                  "after": df.pitch_name.value_counts()})
-    .fillna(0).astype(int)
-    .assign(pct_lost=lambda d: (100 * (1 - d.after / d.before)).round(1))
-    .sort_values("after", ascending=False)
-)
+```{r}
+#| label: group-sizes
+MIN_PITCHERS_PER_TYPE <- 25
+
+sizes <- full_join(
+  count(pitcher_summary, pitch_name, name = "before"),
+  count(model_df, pitch_name, name = "after"),
+  by = "pitch_name"
+) |>
+  mutate(across(c(before, after), ~ replace_na(.x, 0L)),
+         pct_lost = round(100 * (1 - after / before), 1)) |>
+  arrange(desc(after))
 print(sizes)
 
-# A pitch type with only a handful of pitchers cannot support its own slopes;
-# it would be shrunk almost entirely to the population mean anyway, and it
-# destabilises the group-level variances. Require a minimum group size.
-MIN_PITCHERS_PER_TYPE = 25
-keep_types = sizes.index[sizes["after"] >= MIN_PITCHERS_PER_TYPE]
-dropped_types = sorted(set(sizes.index) - set(keep_types))
-if dropped_types:
-    print(f"\ndropping sparse pitch types: {dropped_types}")
-df = df[df.pitch_name.isin(keep_types)].reset_index(drop=True)
-print(f"modelling rows: {len(df)}, pitch types: {df.pitch_name.nunique()}")
+# A pitch type with only a handful of pitchers cannot support its own slopes; it
+# would be shrunk almost entirely to the population mean anyway, and it
+# destabilises the group-level variances.
+keep_types <- sizes$pitch_name[sizes$after >= MIN_PITCHERS_PER_TYPE]
+dropped_types <- setdiff(sizes$pitch_name, keep_types)
+if (length(dropped_types)) {
+  cat("dropping sparse pitch types:", paste(dropped_types, collapse = ", "), "\n")
+}
+model_df <- model_df |>
+  filter(pitch_name %in% keep_types) |>
+  mutate(pitch_name = factor(pitch_name))
+
+cat(sprintf("modelling rows: %d, pitch types: %d\n",
+            nrow(model_df), nlevels(model_df$pitch_name)))
 ```
 
 ## Collinearity screen
@@ -433,214 +374,210 @@ of `release_pos_x` and `release_pos_z`. Slopes on mutually collinear predictors
 are individually unstable even when the model's predictions are fine — and
 unstable slopes are exactly what Stuff+ is built out of.
 
-```{python}
-#| label: py-vif
-from statsmodels.stats.outliers_influence import variance_inflation_factor
+The model already carries a varying intercept for `pitch_name`, so between-type
+differences are absorbed there and do not destabilise the slopes. What matters
+is collinearity **within** a pitch type. Pooled VIF is dominated by the fact that
+sliders are simply slower and spin differently than four-seamers, and would
+throw away genuinely informative movement variables for the wrong reason.
 
-def within_group_center(frame, cols, group="pitch_name"):
-    """Center each predictor on its own pitch-type mean."""
-    return frame.groupby(group, observed=True)[cols].transform(lambda s: s - s.mean())
+```{r}
+#| label: vif
 
-def vif_table(frame, cols):
-    X = np.column_stack([np.ones(len(frame))] + [frame[c].to_numpy() for c in cols])
-    return (
-        pd.Series({c: variance_inflation_factor(X, i + 1) for i, c in enumerate(cols)},
-                  name="VIF")
-        .sort_values(ascending=False).to_frame().round(2)
-    )
+# VIF_j = 1 / (1 - R^2_j) from regressing predictor j on the others. Written out
+# rather than pulled from car::vif so the notebook needs no extra dependency.
+vif_table <- function(df, cols) {
+  vapply(cols, function(j) {
+    others <- setdiff(cols, j)
+    r2 <- summary(lm(reformulate(others, response = j), data = df))$r.squared
+    1 / (1 - r2)
+  }, numeric(1)) |>
+    sort(decreasing = TRUE) |>
+    round(2)
+}
 
-# The model already carries a varying intercept for `pitch_name`, so between-type
-# differences are absorbed there and do not destabilise the slopes. What matters
-# is collinearity *within* a pitch type. Pooled VIF is dominated by the fact that
-# sliders are simply slower and spin differently than four-seamers, and would
-# throw away genuinely informative movement variables for the wrong reason.
-centered = within_group_center(df, MECH_VARS)
+within_group_center <- function(df, cols, group = "pitch_name") {
+  df |>
+    group_by(.data[[group]]) |>
+    mutate(across(all_of(cols), ~ .x - mean(.x))) |>
+    ungroup() |>
+    select(all_of(cols))
+}
 
-print("pooled correlation (between + within pitch type)")
-print(df[MECH_VARS].corr().round(2).to_string())
-print("\nwithin-pitch-type correlation")
-print(centered.corr().round(2).to_string())
-print("\npooled VIF (misleading here)")
-print(vif_table(df, MECH_VARS).T.to_string())
-print("\nwithin-pitch-type VIF (the one that matters)")
-print(vif_table(centered, MECH_VARS).T.to_string())
+centered <- within_group_center(model_df, MECH_VARS)
+
+cat("pooled correlation (between + within pitch type)\n")
+print(round(cor(model_df[MECH_VARS]), 2))
+cat("\nwithin-pitch-type correlation\n")
+print(round(cor(centered), 2))
+cat("\npooled VIF (misleading here)\n")
+print(vif_table(model_df, MECH_VARS))
+cat("\nwithin-pitch-type VIF (the one that matters)\n")
+print(vif_table(centered, MECH_VARS))
 ```
 
-```{python}
-#| label: py-vif-prune
-VIF_THRESHOLD = 5.0
+```{r}
+#| label: vif-prune
+VIF_THRESHOLD <- 5
 
-def prune_by_vif(frame, cols, threshold=VIF_THRESHOLD):
-    """Iteratively drop the single worst-inflated predictor until all VIF < threshold."""
-    cols, dropped = list(cols), []
-    while len(cols) > 1:
-        v = vif_table(frame, cols)["VIF"]
-        if v.max() < threshold:
-            break
-        worst = v.idxmax()
-        dropped.append((worst, round(float(v.max()), 2)))
-        cols.remove(worst)
-    return cols, dropped
+prune_by_vif <- function(df, cols, threshold = VIF_THRESHOLD) {
+  dropped <- character(0)
+  while (length(cols) > 1) {
+    v <- vif_table(df, cols)
+    if (v[1] < threshold) break
+    cat(sprintf("dropped %s (within-type VIF = %.2f)\n", names(v)[1], v[1]))
+    dropped <- c(dropped, names(v)[1])
+    cols <- setdiff(cols, names(v)[1])
+  }
+  cols
+}
 
-PRED_VARS, vif_dropped = prune_by_vif(centered, MECH_VARS)
-for name, val in vif_dropped:
-    print(f"dropped {name} (within-type VIF = {val})")
-print("\nretained predictors:", PRED_VARS)
-print(vif_table(centered, PRED_VARS).T.to_string())
+PRED_VARS <- prune_by_vif(centered, MECH_VARS)
+cat("\nretained predictors:", paste(PRED_VARS, collapse = ", "), "\n")
+print(vif_table(centered, PRED_VARS))
 ```
 
-## Standardization and response
+## Standardization
 
-```{python}
-#| label: py-standardize
-STD_STATS = df[PRED_VARS].agg(["mean", "std"])
-print(STD_STATS.round(3).to_string())
+```{r}
+#| label: standardize
+std_stats <- model_df |>
+  summarise(across(all_of(PRED_VARS), list(mean = mean, sd = sd))) |>
+  pivot_longer(everything(),
+               names_to = c("var", ".value"),
+               names_pattern = "^(.*)_(mean|sd)$")
+print(std_stats |> mutate(across(c(mean, sd), ~ round(.x, 3))))
 
-model_df = df.copy()
-for v in PRED_VARS:
-    model_df[v] = (model_df[v] - STD_STATS.loc["mean", v]) / STD_STATS.loc["std", v]
+model_df <- model_df |>
+  mutate(across(all_of(PRED_VARS), ~ as.numeric(scale(.x))))
 
-model_df["pitch_name"] = pd.Categorical(model_df["pitch_name"])
-model_df["successes"] = model_df["n_whiffs"].astype(int)
-model_df["trials"] = model_df["n_swings"].astype(int)
-assert (model_df.successes <= model_df.trials).all()
-assert model_df[PRED_VARS].notna().all().all()
+stopifnot(all(model_df$n_whiffs <= model_df$n_swings))
+stopifnot(!anyNA(model_df[PRED_VARS]))
 ```
 
-## Model 1 — hierarchical linear beta-binomial
+# Model 1 — hierarchical linear beta-binomial
 
 Swings are the trials and whiffs the successes. A plain binomial would assume
 the only variation in whiff rate at fixed mechanics is sampling noise; the
-histogram above shows far more spread than that, so the `beta_binomial` family
-carries an extra dispersion parameter `kappa`.
+histogram above shows far more spread than that, so `beta_binomial()` carries an
+extra dispersion parameter `phi`.
 
 The varying intercept **and** varying slopes by `pitch_name` are what make this
 hierarchical: velocity should matter differently for a four-seamer than for a
 changeup, and each pitch type gets a partially-pooled posterior of its own
 rather than being forced onto one league-wide slope.
 
-```{python}
-#| label: py-m1-build
-def hierarchical_formula(terms, group="pitch_name", response="p(successes, trials)"):
-    fixed = " + ".join(terms)
-    return f"{response} ~ {fixed} + (1 + {fixed} | {group})"
+Note the `||` rather than `|`. brms defaults to *correlated* group-level terms,
+which here would mean estimating a full correlation matrix over the intercept
+and every slope — dozens of correlation parameters from a handful of pitch
+types. That is not identifiable from this much data and shows up as divergent
+transitions and $\hat{R}$ warnings. `||` drops the correlations and keeps one
+variance per term, which is what the data can actually support.
 
-f1 = hierarchical_formula(PRED_VARS)
+```{r}
+#| label: m1-formula
+hierarchical_formula <- function(terms, group = "pitch_name") {
+  fixed <- paste(terms, collapse = " + ")
+  as.formula(sprintf(
+    "n_whiffs | trials(n_swings) ~ %s + (1 + %s || %s)", fixed, fixed, group
+  ))
+}
+
+f1 <- hierarchical_formula(PRED_VARS)
 print(f1)
 
-m1 = bmb.Model(f1, model_df, family="beta_binomial")
-m1.build()
-print(m1)
-
-# model.graph() shells out to the graphviz binary, which is often not installed;
-# it is a nicety, not a dependency.
-try:
-    m1.graph()
-except Exception as exc:
-    print(f"(skipping model.graph(): {type(exc).__name__}: {exc})")
+# Weakly informative priors on the logit scale. Predictors are standardized, so
+# a slope of 1 means a one-SD change in mechanics moves the log-odds of a whiff
+# by 1 -- already large. Normal(0, 1) is weakly informative here, not restrictive.
+priors1 <- c(
+  prior(normal(0, 1.5), class = "Intercept"),
+  prior(normal(0, 1),   class = "b"),
+  prior(exponential(1), class = "sd"),
+  prior(gamma(0.01, 0.01), class = "phi")
+)
 ```
 
-```{python}
-#| label: py-m1-fit
-idata1 = m1.fit(**SAMPLE_KW)
-ensure_log_likelihood(m1, idata1)
-
-# NOTE: the response is literally named "p(successes, trials)", so the fitted
-# mean does NOT land in idata.posterior["p_mean"]. bambi stores the
-# beta-binomial's parameters under "mu" and "kappa".
-RESPONSE_NAME = m1.response_component.term.name
-print("response name:", RESPONSE_NAME)
-
-az.summary(idata1, var_names=["Intercept", *PRED_VARS, "kappa"]).round(3)
+```{r}
+#| label: m1-fit
+#| cache: true
+m1 <- brm(
+  f1, data = model_df, family = beta_binomial(),
+  prior = priors1,
+  chains = CHAINS, iter = ITER, warmup = WARMUP,
+  control = CTRL,
+  seed = RANDOM_SEED, refresh = 0
+)
+summary(m1)
 ```
 
 # MCMC diagnostics
 
-A posterior is only worth interpreting if the sampler actually explored it.
-The checks below are the standard battery: split $\hat{R}$ (should be < 1.01),
-bulk and tail effective sample size (should comfortably exceed 400 per
-parameter), divergent transitions (should be zero), tree-depth saturation, and
-E-BFMI (below ~0.3 indicates the sampler is struggling with the energy
-distribution).
+A posterior is only worth interpreting if the sampler actually explored it. The
+checks below are the standard battery: split $\hat{R}$ (should be < 1.01), bulk
+and tail effective sample size (should comfortably exceed 400 per parameter),
+divergent transitions (should be zero), tree-depth saturation, and E-BFMI (below
+~0.3 indicates trouble with the energy distribution).
 
-```{python}
-#| label: py-diagnostics
-def mcmc_report(idata, name):
-    # omit_offsets=False keeps the unconstrained `*_log__` copies in the
-    # posterior. They are deterministic transforms of parameters already listed,
-    # so counting them would double-count and clutter the worst-mixing table.
-    sampled = [v for v in idata.posterior.data_vars if not v.endswith("__")]
-    s = az.summary(idata, var_names=sampled)
-    div = int(idata.sample_stats["diverging"].sum())
-    n_draws = idata.posterior.sizes["chain"] * idata.posterior.sizes["draw"]
-    bfmi = az.bfmi(idata)
-    rows = {
-        "model": name,
-        "n_draws": n_draws,
-        "max_rhat": round(float(s["r_hat"].max()), 4),
-        "n_rhat_gt_1.01": int((s["r_hat"] > 1.01).sum()),
-        "min_ess_bulk": int(s["ess_bulk"].min()),
-        "min_ess_tail": int(s["ess_tail"].min()),
-        "divergences": div,
-        "div_pct": round(100 * div / n_draws, 3),
-        "min_bfmi": round(float(np.min(bfmi)), 3),
-    }
-    if "tree_depth" in idata.sample_stats:
-        md = int(idata.sample_stats.attrs.get("max_treedepth", 10))
-        rows["pct_max_treedepth"] = round(
-            100 * float((idata.sample_stats["tree_depth"] >= md).mean()), 2)
-    worst = s.sort_values("ess_bulk").head(5)[["mean", "sd", "r_hat", "ess_bulk", "ess_tail"]]
-    return pd.Series(rows), worst
+```{r}
+#| label: diagnostics
+mcmc_report <- function(fit, name) {
+  # lp__ and lprior are brms bookkeeping, not parameters; including them
+  # distorts the worst-mixing table.
+  s <- summarise_draws(as_draws_array(fit), "rhat", "ess_bulk", "ess_tail") |>
+    filter(!variable %in% c("lp__", "lprior"))
+  np <- nuts_params(fit)
+  div <- sum(np$Value[np$Parameter == "divergent__"])
+  td  <- np$Value[np$Parameter == "treedepth__"]
+  n_draws <- (ITER - WARMUP) * CHAINS
+  bfmi <- tryCatch(rstan::get_bfmi(fit$fit), error = function(e) NA_real_)
+  list(
+    report = tibble(
+      model             = name,
+      n_draws           = n_draws,
+      max_rhat          = round(max(s$rhat, na.rm = TRUE), 4),
+      n_rhat_gt_1.01    = sum(s$rhat > 1.01, na.rm = TRUE),
+      min_ess_bulk      = round(min(s$ess_bulk, na.rm = TRUE)),
+      min_ess_tail      = round(min(s$ess_tail, na.rm = TRUE)),
+      divergences       = div,
+      div_pct           = round(100 * div / n_draws, 3),
+      pct_max_treedepth = round(100 * mean(td >= MAX_TREEDEPTH), 2),
+      min_bfmi          = round(min(bfmi, na.rm = TRUE), 3)
+    ),
+    worst = s |> arrange(ess_bulk) |> head(5)
+  )
+}
 
-rep1, worst1 = mcmc_report(idata1, "M1 linear")
-print(rep1.to_string())
-print("\nworst-mixing parameters:")
-print(worst1.round(3).to_string())
+rep1 <- mcmc_report(m1, "M1 linear")
+print(as.data.frame(rep1$report))
+cat("\nworst-mixing parameters:\n")
+print(as.data.frame(rep1$worst))
 ```
 
-```{python}
-#| label: py-trace
-az.plot_trace(idata1, var_names=["Intercept", *PRED_VARS[:3], "kappa"],
-              compact=True, figsize=(11, 9))
-plt.tight_layout()
-plt.show()
+```{r}
+#| label: trace
+#| fig-height: 6
+mcmc_trace(m1, regex_pars = "^b_|^phi$")
 ```
 
-```{python}
-#| label: py-energy
-az.plot_energy(idata1, figsize=(6, 4))
-plt.show()
+```{r}
+#| label: energy
+mcmc_nuts_energy(nuts_params(m1))
 ```
 
 ## Posterior predictive check
 
-```{python}
-#| label: py-ppc
-# "pps" and "mean" are the deprecated spellings of these two; the current API
-# is kind="response" (draws of the outcome) and kind="response_params" (mu, kappa).
-m1.predict(idata1, kind="response", random_seed=RANDOM_SEED)
-az.plot_ppc(idata1, num_pp_samples=200, figsize=(7, 4.5))
-plt.title("PPC — whiff counts, M1")
-plt.show()
+```{r}
+#| label: ppc
+pp_check(m1, ndraws = 100) + labs(title = "PPC — whiff counts, M1")
 ```
 
-```{python}
-#| label: py-ppc-rate
-# The PPC above is on the count scale, where differences in `trials` dominate.
+```{r}
+#| label: ppc-rate
+# The PPC above is on the count scale, where differences in `n_swings` dominate.
 # Re-express it as a whiff *rate* so it is comparable with the EDA histogram.
-pp = idata1.posterior_predictive[RESPONSE_NAME]
-trials = model_df["trials"].to_numpy()
-pp_rate = (pp / trials).stack(sample=("chain", "draw")).transpose("sample", ...)
-
-fig, ax = plt.subplots(figsize=(7, 4.5))
-for i in rng.choice(pp_rate.sizes["sample"], 150, replace=False):
-    ax.hist(pp_rate[i].values, bins=40, range=(0, 1), histtype="step",
-            density=True, color="C0", alpha=0.06)
-ax.hist(model_df["whiff_rate"], bins=40, range=(0, 1), histtype="step",
-        density=True, color="k", lw=2, label="observed")
-ax.set_xlabel("whiff rate"); ax.set_ylabel("density")
-ax.set_title("PPC on the rate scale — M1"); ax.legend()
-plt.show()
+yrep <- posterior_predict(m1, ndraws = 150)
+rate_rep <- sweep(yrep, 2, model_df$n_swings, "/")
+ppc_dens_overlay(model_df$whiff_rate, rate_rep) +
+  labs(title = "PPC on the rate scale — M1")
 ```
 
 # Testing the linearity assumption
@@ -649,100 +586,83 @@ A beta-binomial GLM does not assume the whiff *rate* is linear in mechanics — 
 assumes the **logit** of the rate is linear in them. That is the assumption to
 test, and the right tool is the residual, not the raw scatter.
 
-Two complementary checks:
-
 **Binned residual plots.** Raw residuals from a binomial-type model are useless
 to eyeball, so residuals are averaged within bins of each predictor (Gelman &
 Hill). Under a correct specification the binned means scatter around zero with
 no trend; roughly 95% should fall inside the $\pm 2\,\text{SE}$ band.
 
 **A weighted RESET-style curvature test.** For each predictor $x$, regress the
-residual on $x$ and $x^2$ (weighted by number of swings). A non-null quadratic
+residual on $x$ and $x^2$, weighted by number of swings. A non-null quadratic
 coefficient is direct evidence of curvature the linear term is not capturing.
 A global version regresses the residual on the fitted linear predictor and its
-square. Bonferroni-corrected across predictors.
+powers. Bonferroni-corrected across predictors.
 
-```{python}
-#| label: py-resid
-import statsmodels.api as sm
+```{r}
+#| label: resid
+mu1  <- colMeans(posterior_linpred(m1, transform = TRUE))
+eta1 <- colMeans(posterior_linpred(m1))
+y_prop <- model_df$n_whiffs / model_df$n_swings
+resid1 <- y_prop - mu1
+w <- model_df$n_swings
 
-m1.predict(idata1, kind="response_params")
-
-def fitted_mu(idata):
-    """Posterior-mean fitted probability per observation."""
-    return idata.posterior["mu"].mean(dim=("chain", "draw")).values
-
-mu1 = fitted_mu(idata1)
-eta1 = logit(np.clip(mu1, 1e-6, 1 - 1e-6))
-y_prop = (model_df["successes"] / model_df["trials"]).to_numpy()
-resid1 = y_prop - mu1
-w = model_df["trials"].to_numpy().astype(float)
-print(f"mean residual: {np.average(resid1, weights=w):+.5f}  (should be ~0)")
+cat(sprintf("weighted mean residual: %+.5f (should be ~0)\n",
+            weighted.mean(resid1, w)))
 ```
 
-```{python}
-#| label: py-binned-resid
-def binned_residuals(x, resid, weights, n_bins=40):
-    """Gelman-Hill binned residuals: mean residual and +/-2SE band per x-quantile bin."""
-    order = np.argsort(x)
-    xs, rs, ws = x[order], resid[order], weights[order]
-    edges = np.array_split(np.arange(len(xs)), n_bins)
-    out = []
-    for idx in edges:
-        if len(idx) < 2:
-            continue
-        out.append((xs[idx].mean(), rs[idx].mean(),
-                    2 * rs[idx].std(ddof=1) / np.sqrt(len(idx)), len(idx)))
-    return pd.DataFrame(out, columns=["x", "resid", "se2", "n"])
+```{r}
+#| label: binned-resid
+#| fig-height: 6
+binned_residuals <- function(x, resid, n_bins = 40) {
+  o <- order(x)
+  tibble(x = x[o], r = resid[o]) |>
+    mutate(bin = cut(row_number(), breaks = n_bins, labels = FALSE)) |>
+    group_by(bin) |>
+    summarise(x = mean(x), resid = mean(r),
+              se2 = 2 * sd(r) / sqrt(n()), n = n(), .groups = "drop") |>
+    filter(n >= 2)
+}
 
-fig, axes = plt.subplots(2, 3, figsize=(12, 7), sharey=True)
-for ax, v in zip(axes.ravel(), PRED_VARS):
-    b = binned_residuals(model_df[v].to_numpy(), resid1, w)
-    ax.axhline(0, color="k", lw=0.8)
-    ax.fill_between(b.x, -b.se2, b.se2, color="C0", alpha=0.15)
-    ax.scatter(b.x, b.resid, s=14, color="C0")
-    # LOESS through the binned means to make curvature visible
-    sm_l = sm.nonparametric.lowess(b.resid, b.x, frac=0.6, return_sorted=True)
-    ax.plot(sm_l[:, 0], sm_l[:, 1], color="crimson", lw=1.6)
-    ax.set_title(v.replace("avg_", ""), fontsize=9)
-    ax.set_xlabel("z-score")
-for ax in axes.ravel()[len(PRED_VARS):]:
-    ax.set_visible(False)
-axes[0, 0].set_ylabel("mean residual"); axes[1, 0].set_ylabel("mean residual")
-fig.suptitle("Binned residuals vs predictors — M1 (linear)")
-plt.tight_layout()
-plt.show()
+binned_all <- map_dfr(PRED_VARS, function(v) {
+  binned_residuals(model_df[[v]], resid1) |> mutate(term = sub("^avg_", "", v))
+})
+
+ggplot(binned_all, aes(x = x, y = resid)) +
+  geom_ribbon(aes(ymin = -se2, ymax = se2), fill = "steelblue", alpha = 0.15) +
+  geom_hline(yintercept = 0) +
+  geom_point(size = 1.2, color = "steelblue") +
+  geom_smooth(method = "loess", formula = y ~ x, span = 0.75,
+              se = FALSE, color = "crimson", linewidth = 0.7) +
+  facet_wrap(~ term, scales = "free_x") +
+  labs(x = "z-score", y = "mean residual",
+       title = "Binned residuals vs predictors — M1 (linear)") +
+  theme_minimal()
 ```
 
-```{python}
-#| label: py-linearity-test
-def curvature_tests(frame, preds, resid, weights):
-    rows = []
-    for v in preds:
-        x = frame[v].to_numpy()
-        X = sm.add_constant(np.column_stack([x, x ** 2]))
-        fit = sm.WLS(resid, X, weights=weights).fit()
-        rows.append({"term": v, "quad_coef": fit.params[2],
-                     "std_err": fit.bse[2], "t": fit.tvalues[2],
-                     "p_value": fit.pvalues[2]})
-    out = pd.DataFrame(rows)
-    out["p_bonferroni"] = np.minimum(1.0, out.p_value * len(out))
-    out["nonlinear"] = out.p_bonferroni < 0.05
-    return out.sort_values("p_value")
+```{r}
+#| label: linearity-test
+curvature_tests <- function(df, preds, resid, weights) {
+  map_dfr(preds, function(v) {
+    x <- df[[v]]
+    co <- summary(lm(resid ~ x + I(x^2), weights = weights))$coefficients
+    tibble(term = v, quad_coef = co[3, 1], std_err = co[3, 2],
+           t = co[3, 3], p_value = co[3, 4])
+  }) |>
+    mutate(p_bonferroni = pmin(1, p_value * length(preds)),
+           nonlinear = p_bonferroni < 0.05) |>
+    arrange(p_value)
+}
 
-curv = curvature_tests(model_df, PRED_VARS, resid1, w)
-print(curv.round(4).to_string(index=False))
+curv <- curvature_tests(model_df, PRED_VARS, resid1, w)
+print(as.data.frame(curv))
 
 # Global Ramsey RESET on the linear predictor.
-X_reset = sm.add_constant(np.column_stack([eta1, eta1 ** 2, eta1 ** 3]))
-reset_fit = sm.WLS(resid1, X_reset, weights=w).fit()
-reset_p = float(reset_fit.f_test(np.eye(4)[[2, 3]]).pvalue)
-print(f"\nglobal RESET (eta^2, eta^3) p-value: {reset_p:.4g}")
+reset_null <- lm(resid1 ~ eta1, weights = w)
+reset_full <- lm(resid1 ~ eta1 + I(eta1^2) + I(eta1^3), weights = w)
+reset_p <- anova(reset_null, reset_full)[["Pr(>F)"]][2]
+cat(sprintf("\nglobal RESET (eta^2, eta^3) p-value: %.4g\n", reset_p))
 
-LINEARITY_OK = (not curv.nonlinear.any()) and (reset_p >= 0.05)
-print(f"\nlinearity assumption satisfied: {LINEARITY_OK}")
-if not LINEARITY_OK:
-    print("violating terms:", curv.loc[curv.nonlinear, 'term'].tolist() or "(global only)")
+LINEARITY_OK <- !any(curv$nonlinear) && reset_p >= 0.05
+cat(sprintf("\nlinearity assumption satisfied: %s\n", LINEARITY_OK))
 ```
 
 ## Follow-up EDA on the non-linear terms
@@ -751,163 +671,209 @@ Where the curvature test fires, look directly at the empirical logit — the
 observed response on the model's own scale — against the predictor. The
 half-continuity correction keeps groups with zero or all whiffs finite.
 
-```{python}
-#| label: py-emp-logit
-# If the tests reject linearity, examine exactly the terms they rejected. If
-# they do not, still carry the three most-curved terms forward: Model 2 is the
-# nonlinear comparison candidate either way, and a spline model that fails to
-# win is itself the evidence that the linear form is adequate.
-if curv.nonlinear.any():
-    FLAGGED = curv.loc[curv.nonlinear, "term"].tolist()
-    print("linearity rejected for:", FLAGGED)
-else:
-    FLAGGED = curv.head(3)["term"].tolist()
-    print("linearity not rejected; carrying most-curved terms as a check:", FLAGGED)
-
-emp_logit = np.log((model_df.successes + 0.5) /
-                   (model_df.trials - model_df.successes + 0.5)).to_numpy()
-
-fig, axes = plt.subplots(1, len(FLAGGED), figsize=(4.2 * len(FLAGGED), 4), squeeze=False)
-for ax, v in zip(axes.ravel(), FLAGGED):
-    x = model_df[v].to_numpy()
-    ax.scatter(x, emp_logit, s=6, alpha=0.15, color="grey")
-    lo = sm.nonparametric.lowess(emp_logit, x, frac=0.4, return_sorted=True)
-    ax.plot(lo[:, 0], lo[:, 1], color="crimson", lw=2, label="LOESS")
-    b = np.polyfit(x, emp_logit, 1)
-    xs = np.linspace(x.min(), x.max(), 50)
-    ax.plot(xs, np.polyval(b, xs), color="navy", ls="--", lw=1.6, label="linear fit")
-    ax.set_title(v.replace("avg_", "")); ax.set_xlabel("z-score")
-    ax.legend(fontsize=8)
-axes.ravel()[0].set_ylabel("empirical logit(whiff rate)")
-fig.suptitle("Empirical logit vs flagged predictors")
-plt.tight_layout()
-plt.show()
+```{r}
+#| label: flagged
+# If the tests reject linearity, examine exactly the terms they rejected. If they
+# do not, still carry the three most-curved terms forward: Model 2 is the
+# nonlinear comparison candidate either way, and a spline model that fails to win
+# is itself the evidence that the linear form is adequate.
+if (any(curv$nonlinear)) {
+  FLAGGED <- curv$term[curv$nonlinear]
+  cat("linearity rejected for:", paste(FLAGGED, collapse = ", "), "\n")
+} else {
+  FLAGGED <- head(curv$term, 3)
+  cat("linearity not rejected; carrying most-curved terms as a check:",
+      paste(FLAGGED, collapse = ", "), "\n")
+}
 ```
 
-```{python}
-#| label: py-emp-logit-bytype
+```{r}
+#| label: emp-logit
+model_df <- model_df |>
+  mutate(emp_logit = log((n_whiffs + 0.5) / (n_swings - n_whiffs + 0.5)))
+
+model_df |>
+  select(all_of(c(FLAGGED, "emp_logit"))) |>
+  pivot_longer(all_of(FLAGGED), names_to = "term", values_to = "z") |>
+  ggplot(aes(z, emp_logit)) +
+  geom_point(alpha = 0.15, size = 0.6, color = "grey40") +
+  geom_smooth(method = "loess", formula = y ~ x, se = FALSE,
+              color = "crimson", linewidth = 0.9) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE,
+              color = "navy", linetype = "dashed", linewidth = 0.8) +
+  facet_wrap(~ term, scales = "free_x") +
+  labs(x = "z-score", y = "empirical logit(whiff rate)",
+       title = "Empirical logit vs flagged predictors",
+       subtitle = "red = LOESS, navy dashed = linear fit") +
+  theme_minimal()
+```
+
+```{r}
+#| label: emp-logit-bytype
 # The same curve, split by pitch type: a bend that appears only in the pooled
 # view can be Simpson's paradox from differing pitch-type means rather than a
 # genuine within-type non-linearity. If it survives the split, it is real.
-v = FLAGGED[0]
-types = model_df.pitch_name.value_counts().head(6).index.tolist()
-fig, ax = plt.subplots(figsize=(7.5, 4.5))
-for i, t in enumerate(types):
-    sub = model_df[model_df.pitch_name == t]
-    x = sub[v].to_numpy()
-    el = np.log((sub.successes + 0.5) / (sub.trials - sub.successes + 0.5)).to_numpy()
-    lo = sm.nonparametric.lowess(el, x, frac=0.7, return_sorted=True)
-    ax.plot(lo[:, 0], lo[:, 1], lw=1.8, color=f"C{i}", label=t)
-ax.set_xlabel(f"{v} (z-score)"); ax.set_ylabel("empirical logit(whiff rate)")
-ax.set_title(f"Within-pitch-type shape of {v}"); ax.legend(fontsize=8)
-plt.show()
+v <- FLAGGED[1]
+top_types <- names(sort(table(model_df$pitch_name), decreasing = TRUE))[1:6]
+
+model_df |>
+  filter(pitch_name %in% top_types) |>
+  ggplot(aes(.data[[v]], emp_logit, color = pitch_name)) +
+  geom_smooth(method = "loess", formula = y ~ x, se = FALSE, linewidth = 0.9) +
+  labs(x = paste(v, "(z-score)"), y = "empirical logit(whiff rate)",
+       title = paste("Within-pitch-type shape of", v), color = NULL) +
+  theme_minimal()
 ```
 
 # Model 2 — hierarchical spline beta-binomial
 
 Where linearity fails, the fix is to keep the hierarchy and the beta-binomial
 likelihood exactly as they are and relax only the *functional form*: replace the
-flagged linear terms with a cubic B-spline basis. This is still fitted with
-NUTS, so it remains a fully Bayesian MCMC model — it simply has a more flexible
-mean function.
+flagged linear terms with a smooth. `s()` fits a **penalized** thin-plate
+regression spline, with the wiggliness controlled by a smoothing standard
+deviation that Stan estimates alongside everything else.
 
-The group-specific terms stay linear. Per-pitch-type spline coefficients would
-add `df` × (number of pitch types) parameters, and with a few dozen pitchers in
-the smaller types there is not enough information to identify them; the model
-would be all prior and no data.
+The penalty is doing real work here, not just tidying the syntax. An earlier
+version of this model used a fixed-`df` B-spline basis, which has to be given
+exactly the right flexibility up front; given too much it chases noise between
+knots. The resulting posterior was diffuse enough that its per-draw predictions
+were far worse than its posterior mean, PSIS-LOO degenerated completely
+(`p_loo` of 14302 against 2021 observations, with 98% of Pareto $k$ above 0.7),
+and no amount of shrinking the basis or tightening the prior rescued it.
+Estimating the penalty instead of fixing the basis width removes the problem at
+source: the LOO reliability check below passes for both models.
 
-```{python}
-#| label: py-m2-build
-SPLINE_DF = 4
-spline_terms = [f"bs({v}, df={SPLINE_DF})" if v in FLAGGED else v for v in PRED_VARS]
+The group-specific terms stay linear. Per-pitch-type smooths would add a
+smoothing parameter and basis per pitch type, and with a few dozen pitchers in
+the smaller types there is not enough information to identify them.
 
-f2 = (
-    "p(successes, trials) ~ " + " + ".join(spline_terms)
-    + " + (1 + " + " + ".join(PRED_VARS) + " | pitch_name)"
-)
+```{r}
+#| label: m2-formula
+SPLINE_K <- 5
+
+spline_terms <- if_else(PRED_VARS %in% FLAGGED,
+                        sprintf("s(%s, k = %d)", PRED_VARS, SPLINE_K),
+                        PRED_VARS)
+
+f2 <- as.formula(sprintf(
+  "n_whiffs | trials(n_swings) ~ %s + (1 + %s || pitch_name)",
+  paste(spline_terms, collapse = " + "),
+  paste(PRED_VARS, collapse = " + ")
+))
 print(f2)
 
-# B-spline basis columns are bounded in [0, 1] with small variance, so bambi's
-# automatic prior scaling inflates their sigmas to 10-30 on the logit scale.
-# That is effectively flat and lets the spline chase noise between knots. Effects
-# here are order 1 on the logit scale, so give the spline coefficients an
-# explicitly regularizing prior and pin the intercept and group-level scale to
-# match M1 -- otherwise M2 wins or loses the comparison on prior width rather
-# than on functional form.
-priors2 = {t: bmb.Prior("Normal", mu=0, sigma=1.5)
-           for t in spline_terms if t.startswith("bs(")}
-priors2["Intercept"] = bmb.Prior("Normal", mu=0, sigma=2.5)
-priors2["1|pitch_name"] = bmb.Prior(
-    "Normal", mu=0, sigma=bmb.Prior("HalfNormal", sigma=2.5)
+# `sds` is the prior on the smooths' standard deviations -- the penalty. An
+# exponential(1) keeps the smooths shrinking toward linear unless the data
+# genuinely support curvature.
+priors2 <- c(
+  prior(normal(0, 1.5), class = "Intercept"),
+  prior(normal(0, 1),   class = "b"),
+  prior(exponential(1), class = "sd"),
+  prior(exponential(1), class = "sds"),
+  prior(gamma(0.01, 0.01), class = "phi")
 )
-
-m2 = bmb.Model(f2, model_df, family="beta_binomial", priors=priors2)
-
-# nutpie hands its results to arviz through arrow, and that conversion splits
-# variable names on commas -- so a term named "bs(avg_release_speed, df=4)"
-# produces the dim name " df=4)_dim" and the fit dies with
-# KeyError: ' df=4)_dim'. Aliasing the spline terms to comma-free names avoids
-# it entirely and reads better in the summaries. Priors are keyed on the real
-# term names, not the aliases, so `priors2` above is unaffected.
-SPLINE_ALIAS = {
-    t: "s_" + re.match(r"bs\((\w+),", t).group(1)
-    for t in spline_terms if t.startswith("bs(")
-}
-print("aliases:", SPLINE_ALIAS)
-m2.set_alias(SPLINE_ALIAS)
-
-m2.build()
-print(m2)
 ```
 
-```{python}
-#| label: py-m2-fit
-idata2 = m2.fit(**SAMPLE_KW)
-ensure_log_likelihood(m2, idata2)
-rep2, worst2 = mcmc_report(idata2, "M2 spline")
-print(az.summary(idata2, var_names=list(SPLINE_ALIAS.values())).round(3).to_string())
-print()
-print(pd.concat([rep1, rep2], axis=1).to_string())
-print("\nworst-mixing parameters (M2):")
-print(worst2.round(3).to_string())
+```{r}
+#| label: m2-fit
+#| cache: true
+m2 <- brm(
+  f2, data = model_df, family = beta_binomial(),
+  prior = priors2,
+  chains = CHAINS, iter = ITER, warmup = WARMUP,
+  control = CTRL,
+  seed = RANDOM_SEED, refresh = 0
+)
+summary(m2)
 ```
 
-```{python}
-#| label: py-m2-resid
-m2.predict(idata2, kind="response_params")
-mu2 = fitted_mu(idata2)
-resid2 = y_prop - mu2
+```{r}
+#| label: m2-diagnostics
+rep2 <- mcmc_report(m2, "M2 spline")
+print(as.data.frame(bind_rows(rep1$report, rep2$report)))
+cat("\nworst-mixing parameters (M2):\n")
+print(as.data.frame(rep2$worst))
+```
 
-curv2 = curvature_tests(model_df, PRED_VARS, resid2, w)
-print("curvature tests after splines:")
-print(curv2.round(4).to_string(index=False))
+```{r}
+#| label: m2-smooths
+#| fig-height: 3.2
+# What the penalty actually decided: a smooth shrunk to a straight line is the
+# model telling you the linear term was adequate.
+plot(conditional_smooths(m2), ask = FALSE)
+```
 
-fig, axes = plt.subplots(1, len(FLAGGED), figsize=(4.2 * len(FLAGGED), 3.6), squeeze=False)
-for ax, v in zip(axes.ravel(), FLAGGED):
-    b = binned_residuals(model_df[v].to_numpy(), resid2, w)
-    ax.axhline(0, color="k", lw=0.8)
-    ax.fill_between(b.x, -b.se2, b.se2, color="C2", alpha=0.15)
-    ax.scatter(b.x, b.resid, s=14, color="C2")
-    lo = sm.nonparametric.lowess(b.resid, b.x, frac=0.6, return_sorted=True)
-    ax.plot(lo[:, 0], lo[:, 1], color="crimson", lw=1.6)
-    ax.set_title(v.replace("avg_", ""), fontsize=9)
-fig.suptitle("Binned residuals — M2 (splines on flagged terms)")
-plt.tight_layout()
-plt.show()
+```{r}
+#| label: m2-resid
+#| fig-height: 3.2
+mu2 <- colMeans(posterior_linpred(m2, transform = TRUE))
+resid2 <- y_prop - mu2
+
+cat("curvature tests after splines:\n")
+print(as.data.frame(curvature_tests(model_df, PRED_VARS, resid2, w)))
+
+map_dfr(FLAGGED, function(v) {
+  binned_residuals(model_df[[v]], resid2) |> mutate(term = sub("^avg_", "", v))
+}) |>
+  ggplot(aes(x, resid)) +
+  geom_ribbon(aes(ymin = -se2, ymax = se2), fill = "seagreen", alpha = 0.15) +
+  geom_hline(yintercept = 0) +
+  geom_point(size = 1.2, color = "seagreen") +
+  geom_smooth(method = "loess", formula = y ~ x, span = 0.75,
+              se = FALSE, color = "crimson", linewidth = 0.7) +
+  facet_wrap(~ term, scales = "free_x") +
+  labs(x = "z-score", y = "mean residual",
+       title = "Binned residuals — M2 (penalized splines on flagged terms)") +
+  theme_minimal()
 ```
 
 ## Fit comparison by LOO
 
-```{python}
-#| label: py-loo
-comparison = az.compare({"M1 linear": idata1, "M2 spline": idata2}, ic="loo")
-print(comparison.round(2).to_string())
-az.plot_compare(comparison, figsize=(7, 3))
-plt.show()
+```{r}
+#| label: loo
+loo1 <- loo(m1)
+loo2 <- loo(m2)
+comparison <- loo_compare(list("M1 linear" = loo1, "M2 spline" = loo2))
+print(comparison)
 ```
 
-LOO measures out-of-sample density for the *whiff* response. It is a useful fit
-check, but it is not the criterion asked for — that is run value, below.
+PSIS-LOO is an importance-sampling approximation and it can fail silently. Two
+quantities say whether the numbers above mean anything: the Pareto shape $k$ per
+observation (above ~0.7 the importance weights have infinite variance) and
+`p_loo`, the effective number of parameters. `p_loo` exceeding the number of
+observations is not a large model — it is a broken estimate. When that happens
+the fix is *not* to tune the model until the diagnostic stops complaining, which
+would be selecting on the diagnostic rather than on predictive accuracy; it is
+to fall back on cross-validation, which refits and needs no importance weights.
+Nothing here depends on it: the selection criterion below is out-of-sample
+$R^2$ / MSE on run value, and that is a $K$-fold estimate already.
+
+```{r}
+#| label: loo-reliability
+loo_reliability <- function(l, name) {
+  k <- l$diagnostics$pareto_k
+  n <- length(k)
+  bad <- sum(k > 0.7)
+  p_loo <- l$estimates["p_loo", "Estimate"]
+  reliable <- (p_loo < n / 2) && (bad / n <= 0.05)
+  cat(sprintf("%-10s elpd=%10.1f  p_loo=%9.1f  (n=%d)  k>0.7: %4d (%4.1f%%)  max k=%.2f  -> %s\n",
+              name, l$estimates["elpd_loo", "Estimate"], p_loo, n,
+              bad, 100 * bad / n, max(k), if (reliable) "ok" else "UNRELIABLE"))
+  reliable
+}
+
+LOO_RELIABLE <- c(
+  "M1 linear" = loo_reliability(loo1, "M1 linear"),
+  "M2 spline" = loo_reliability(loo2, "M2 spline")
+)
+LOO_TRUSTWORTHY <- all(LOO_RELIABLE)
+if (!LOO_TRUSTWORTHY) {
+  cat("\nLOO cannot rank these models and the elpd column should not be quoted.",
+      "\nThe comparison that does not depend on importance weights is the",
+      "\ngrouped K-fold run-value evaluation below, which is the stated",
+      "\nselection criterion anyway.\n")
+}
+```
 
 # Per-pitch-type posteriors
 
@@ -916,53 +882,86 @@ posterior for each type's *slope* on a mechanic (does velocity buy more whiffs
 on a four-seamer than on a changeup?), and the posterior for each type's whiff
 rate at that type's own average mechanics.
 
-```{python}
-#| label: py-forest-slopes
-FOCUS = "avg_release_speed"
-az.plot_forest(
-    idata1,
-    var_names=[FOCUS, f"{FOCUS}|pitch_name"],
-    combined=True, figsize=(7.5, 5.5), r_hat=True,
-)
-plt.title(f"Posterior slope on {FOCUS}: population and by pitch type")
-plt.tight_layout()
-plt.show()
+```{r}
+#| label: forest-slopes
+# Pick a mechanic that survived the VIF screen -- avg_release_speed normally
+# does, but do not assume it.
+FOCUS <- if ("avg_release_speed" %in% PRED_VARS) "avg_release_speed" else PRED_VARS[1]
+
+# The group-level deviations r_pitch_name[type, term] are offsets from the
+# population slope b_<term>; adding them back gives each type's own slope.
+# M2 replaces the flagged population terms with smooths, so `b_<term>` exists
+# only for terms that stayed linear. The *group-level* slopes are linear in both
+# models, so this plot reads M1, where the population slope is always defined.
+slope_fit <- m1
+
+slope_draws <- as_draws_df(slope_fit) |>
+  select(matches(sprintf("^b_%s$|^r_pitch_name\\[.*,%s\\]$", FOCUS, FOCUS)))
+pop <- slope_draws[[paste0("b_", FOCUS)]]
+
+type_slopes <- slope_draws |>
+  select(-all_of(paste0("b_", FOCUS))) |>
+  imap_dfr(~ tibble(
+    # brms turns factor levels into parameter names, so spaces arrive as dots
+    # ("4-Seam.Fastball"). Put them back for the axis labels.
+    pitch_name = gsub(".", " ", fixed = TRUE,
+                      sub(sprintf("^r_pitch_name\\[(.*),%s\\]$", FOCUS), "\\1", .y)),
+    slope = .x + pop
+  ))
+
+type_slopes |>
+  group_by(pitch_name) |>
+  summarise(mean = mean(slope),
+            lo = quantile(slope, 0.03), hi = quantile(slope, 0.97),
+            .groups = "drop") |>
+  bind_rows(tibble(pitch_name = "POPULATION", mean = mean(pop),
+                   lo = quantile(pop, 0.03), hi = quantile(pop, 0.97))) |>
+  mutate(pitch_name = fct_reorder(pitch_name, mean)) |>
+  ggplot(aes(mean, pitch_name)) +
+  geom_vline(xintercept = 0, linetype = "dotted") +
+  geom_pointrange(aes(xmin = lo, xmax = hi)) +
+  labs(x = sprintf("posterior slope on %s (log-odds per SD)", FOCUS),
+       y = NULL, title = "Population slope and per-pitch-type slopes") +
+  theme_minimal()
 ```
 
-```{python}
-#| label: py-type-posterior
-def type_posterior(model, idata, frame, preds, group="pitch_name"):
-    """Posterior whiff rate for each pitch type, evaluated at that type's own
-    average mechanics (all predictors are standardized, so this is the type's
-    typical pitch rather than a league-average one)."""
-    grid = (frame.groupby(group, observed=True)[preds].mean().reset_index())
-    grid["successes"], grid["trials"] = 0, 1
-    pred = model.predict(idata, data=grid, kind="response_params", inplace=False)
-    mu = pred.posterior["mu"]
-    mu = mu.assign_coords({mu.dims[-1]: grid[group].to_numpy()})
-    return grid, mu
+```{r}
+#| label: type-posterior
+type_posterior <- function(fit, df, preds) {
+  grid <- df |>
+    group_by(pitch_name) |>
+    summarise(across(all_of(preds), mean), .groups = "drop") |>
+    mutate(n_swings = 1)          # trials must be present; transform gives mu
+  mu <- posterior_linpred(fit, newdata = grid, transform = TRUE)
+  colnames(mu) <- as.character(grid$pitch_name)
+  list(grid = grid, mu = mu)
+}
 
-grid1, mu_by_type1 = type_posterior(m1, idata1, model_df, PRED_VARS)
+tp <- type_posterior(m2, model_df, PRED_VARS)
 
-summary_by_type = (
-    az.summary(mu_by_type1, hdi_prob=0.94)
-    .assign(pitch_name=grid1["pitch_name"].to_numpy())
-    .set_index("pitch_name")[["mean", "sd", "hdi_3%", "hdi_97%"]]
-    .sort_values("mean", ascending=False)
-)
-print(summary_by_type.round(3).to_string())
+summary_by_type <- tibble(
+  pitch_name = colnames(tp$mu),
+  mean = colMeans(tp$mu),
+  sd   = apply(tp$mu, 2, sd),
+  lo   = apply(tp$mu, 2, quantile, 0.03),
+  hi   = apply(tp$mu, 2, quantile, 0.97)
+) |> arrange(desc(mean))
+print(as.data.frame(summary_by_type |> mutate(across(where(is.numeric), ~ round(.x, 3)))))
 
-az.plot_forest(mu_by_type1, combined=True, figsize=(7, 4.5))
-plt.title("Posterior whiff rate at pitch-type-average mechanics (M1)")
-plt.tight_layout()
-plt.show()
+summary_by_type |>
+  mutate(pitch_name = fct_reorder(pitch_name, mean)) |>
+  ggplot(aes(mean, pitch_name)) +
+  geom_pointrange(aes(xmin = lo, xmax = hi)) +
+  labs(x = "posterior whiff rate at pitch-type-average mechanics",
+       y = NULL, title = "Per-pitch-type posterior") +
+  theme_minimal()
 ```
 
 # Stuff+
 
 **Definition.** For posterior draw $d$, pitcher $i$ throwing pitch type $k$, let
-$\eta_{id}$ be the model's latent log-odds of a whiff. Standardize it against
-the posterior for *that pitch type*:
+$\eta_{id}$ be the model's latent log-odds of a whiff. Standardize it against the
+posterior for *that pitch type*:
 
 $$
 z_{id} \;=\; \frac{\eta_{id} - m_{kd}}{s_{kd}},
@@ -973,78 +972,82 @@ $$
 where $m_{kd}$ and $s_{kd}$ are the mean and standard deviation of $\eta_{\cdot d}$
 across the pitchers who throw type $k$, computed **within each draw**. So 100 is
 average for that pitch type, one standard deviation is 10 points, and higher is
-better. Doing the standardization draw-by-draw rather than on posterior means
-means Stuff+ inherits the model's uncertainty: each pitcher gets a posterior
-*distribution* of Stuff+, not a point estimate.
+better. Standardizing draw-by-draw rather than on posterior means lets Stuff+
+inherit the model's uncertainty: each pitcher gets a posterior *distribution* of
+Stuff+, not a point estimate.
 
-```{python}
-#| label: py-stuffplus
-MAX_DRAWS = 2000
+```{r}
+#| label: stuffplus
+stuff_plus_draws <- function(fit, df, center = 100, scale = 10) {
+  eta <- posterior_linpred(fit)          # draws x observations, link scale
+  codes <- as.integer(df$pitch_name)
+  z <- eta
+  for (k in unique(codes)) {
+    sel <- which(codes == k)
+    sub <- eta[, sel, drop = FALSE]
+    z[, sel] <- (sub - rowMeans(sub)) / apply(sub, 1, sd)
+  }
+  center + scale * z
+}
 
-def stuff_plus_draws(idata, frame, group="pitch_name", center=100.0, scale=10.0,
-                     max_draws=MAX_DRAWS):
-    mu = (idata.posterior["mu"]
-          .stack(sample=("chain", "draw"))
-          .transpose("sample", ...)
-          .values)
-    if mu.shape[0] > max_draws:                       # thin for memory
-        idx = np.linspace(0, mu.shape[0] - 1, max_draws).astype(int)
-        mu = mu[idx]
-    eta = logit(np.clip(mu, 1e-9, 1 - 1e-9))
-    codes = pd.Categorical(frame[group]).codes
-    z = np.empty_like(eta)
-    for k in np.unique(codes):
-        sel = codes == k
-        sub = eta[:, sel]
-        z[:, sel] = (sub - sub.mean(axis=1, keepdims=True)) / sub.std(axis=1, ddof=1, keepdims=True)
-    return center + scale * z            # (draws, observations)
+# Highest-density interval: the shortest interval containing `prob` of the mass.
+hdi1 <- function(x, prob = 0.94) {
+  x <- sort(x); n <- length(x); m <- max(1L, floor(prob * n))
+  i <- which.min(x[(m + 1):n] - x[1:(n - m)])
+  c(x[i], x[i + m])
+}
 
-def summarise_stuff(sp_draws, frame):
-    # az.hdi expects (chain, draw, *shape); sp_draws is (draw, obs).
-    hdi = az.hdi(sp_draws[None, :, :], hdi_prob=0.94)  # -> (obs, 2)
-    hdi = np.asarray(hdi["x"] if hasattr(hdi, "keys") else hdi)
-    return frame.assign(
-        stuff_plus=sp_draws.mean(axis=0),
-        stuff_plus_sd=sp_draws.std(axis=0, ddof=1),
-        stuff_plus_lo=hdi[:, 0],
-        stuff_plus_hi=hdi[:, 1],
-    )
+summarise_stuff <- function(sp, df) {
+  bounds <- t(apply(sp, 2, hdi1))
+  df |> mutate(
+    stuff_plus    = colMeans(sp),
+    stuff_plus_sd = apply(sp, 2, sd),
+    stuff_plus_lo = bounds[, 1],
+    stuff_plus_hi = bounds[, 2]
+  )
+}
 
-sp1 = stuff_plus_draws(idata1, model_df)
-sp2 = stuff_plus_draws(idata2, model_df)
+stuff1 <- summarise_stuff(stuff_plus_draws(m1, model_df), model_df)
+stuff2 <- summarise_stuff(stuff_plus_draws(m2, model_df), model_df)
 
-stuff1 = summarise_stuff(sp1, df.copy())
-stuff2 = summarise_stuff(sp2, df.copy())
-
-print(stuff1.groupby("pitch_name", observed=True)["stuff_plus"]
-      .agg(["mean", "std", "min", "max"]).round(2).to_string())
+stuff1 |>
+  group_by(pitch_name) |>
+  summarise(mean = mean(stuff_plus), sd = sd(stuff_plus),
+            min = min(stuff_plus), max = max(stuff_plus), .groups = "drop") |>
+  mutate(across(where(is.numeric), ~ round(.x, 2))) |>
+  as.data.frame() |>
+  print()
 ```
 
-```{python}
-#| label: py-stuff-leaders
-cols = ["player_name", "pitch_name", "n_pitches", "whiff_rate",
-        "stuff_plus", "stuff_plus_sd", "stuff_plus_lo", "stuff_plus_hi", "run_value"]
-print("top 15 by Stuff+ (M1)")
-print(stuff1.sort_values("stuff_plus", ascending=False).head(15)[cols]
-      .round(3).to_string(index=False))
-print("\nbottom 10 by Stuff+ (M1)")
-print(stuff1.sort_values("stuff_plus").head(10)[cols].round(3).to_string(index=False))
+```{r}
+#| label: stuff-leaders
+show_cols <- c("player_name", "pitch_name", "n_pitches", "whiff_rate",
+               "stuff_plus", "stuff_plus_sd", "stuff_plus_lo", "stuff_plus_hi",
+               "run_value")
+cat("top 15 by Stuff+ (M1)\n")
+stuff1 |> slice_max(stuff_plus, n = 15) |> select(all_of(show_cols)) |>
+  mutate(across(where(is.numeric), ~ round(.x, 3))) |> as.data.frame() |> print()
+cat("\nbottom 10 by Stuff+ (M1)\n")
+stuff1 |> slice_min(stuff_plus, n = 10) |> select(all_of(show_cols)) |>
+  mutate(across(where(is.numeric), ~ round(.x, 3))) |> as.data.frame() |> print()
 ```
 
-```{python}
-#| label: py-stuff-uncertainty
-fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-axes[0].hist(stuff1.stuff_plus, bins=40, color="steelblue", edgecolor="white")
-axes[0].axvline(100, color="red", ls="--")
-axes[0].set_xlabel("Stuff+"); axes[0].set_ylabel("count")
-axes[0].set_title("Stuff+ distribution (M1)")
+```{r}
+#| label: stuff-uncertainty
+p_dist <- ggplot(stuff1, aes(stuff_plus)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 100, color = "red", linetype = "dashed") +
+  labs(x = "Stuff+", y = "count", title = "Stuff+ distribution (M1)") +
+  theme_minimal()
 
-axes[1].scatter(stuff1.n_pitches, stuff1.stuff_plus_sd, s=8, alpha=0.35)
-axes[1].set_xscale("log")
-axes[1].set_xlabel("pitches thrown (log)"); axes[1].set_ylabel("posterior SD of Stuff+")
-axes[1].set_title("Uncertainty shrinks with sample size")
-plt.tight_layout()
-plt.show()
+p_unc <- ggplot(stuff1, aes(n_pitches, stuff_plus_sd)) +
+  geom_point(alpha = 0.35, size = 0.9) +
+  scale_x_log10() +
+  labs(x = "pitches thrown (log)", y = "posterior SD of Stuff+",
+       title = "Uncertainty shrinks with sample size") +
+  theme_minimal()
+
+print(p_dist); print(p_unc)
 ```
 
 # Model selection on cumulative run value
@@ -1055,145 +1058,155 @@ be handled for that comparison to mean anything.
 *Exposure.* `run_value` is a **sum** over pitches, so it scales with usage: a
 pitcher who threw 600 sliders has a larger $|{\rm run\ value}|$ than one who
 threw 40, regardless of quality. Any evaluation that ignores `n_pitches` mostly
-measures playing time. Pitch count is therefore included in every specification,
+measures playing time. Pitch count is therefore in every specification,
 including the baseline, so the reported gain is Stuff+'s **incremental**
 contribution rather than a restatement of usage.
 
 *Leakage.* Rows are pitcher × pitch-type, and one pitcher contributes several
 rows. Splitting rows at random would put the same pitcher's talent on both sides
-of the fold. Cross-validation is grouped by pitcher.
+of the fold, so cross-validation is grouped by pitcher.
 
-Scores are reported out-of-sample; in-sample values are shown alongside only to
-expose overfitting.
+```{r}
+#| label: eval
+TARGET   <- "run_value"      # cumulative; negative favours the pitcher
+N_SPLITS <- 5
+BASELINE <- "baseline (exposure + pitch type)"
 
-```{python}
-#| label: py-eval
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error, r2_score
-from sklearn.model_selection import GroupKFold
+group_kfold <- function(groups, k = N_SPLITS, seed = RANDOM_SEED) {
+  set.seed(seed)
+  u <- unique(groups)
+  assign <- setNames(sample(rep_len(seq_len(k), length(u))), u)
+  unname(assign[as.character(groups)])
+}
 
-TARGET = "run_value"          # cumulative run value, negative favours pitcher
-N_SPLITS = 5
-BASELINE = "baseline (exposure + pitch type)"
+r2 <- function(y, pred) 1 - sum((y - pred)^2) / sum((y - mean(y))^2)
 
-def design(frame, use_stuff):
-    """Exposure + pitch-type fixed effects, optionally plus Stuff+."""
-    X = pd.get_dummies(frame[["pitch_name"]], drop_first=True, dtype=float)
-    X["n_pitches"] = frame["n_pitches"].to_numpy()
-    if use_stuff:
-        X["stuff_plus"] = frame["stuff_plus"].to_numpy()
-        # Stuff+ is standardized within pitch type, so its effect on a *cumulative*
-        # total must scale with how often the pitch was thrown.
-        X["stuff_x_pitches"] = frame["stuff_plus"].to_numpy() * frame["n_pitches"].to_numpy()
-    return X.to_numpy()
+evaluate <- function(df, label, use_stuff = TRUE, target = TARGET) {
+  rhs <- c("n_pitches", "pitch_name")
+  if (use_stuff) {
+    # Stuff+ is standardized within pitch type, so its effect on a *cumulative*
+    # total must scale with how often the pitch was thrown.
+    rhs <- c(rhs, "stuff_plus", "stuff_plus:n_pitches")
+  }
+  fml <- reformulate(rhs, response = target)
 
-def evaluate(frame, label, use_stuff=True, target=TARGET):
-    X, y = design(frame, use_stuff), frame[target].to_numpy()
-    groups = frame["player_name"].to_numpy()
-    oof = np.zeros_like(y, dtype=float)
-    for tr, te in GroupKFold(n_splits=N_SPLITS).split(X, y, groups):
-        oof[te] = LinearRegression().fit(X[tr], y[tr]).predict(X[te])
-    ins = LinearRegression().fit(X, y).predict(X)
-    return {
-        "model": label,
-        "cv_r2": r2_score(y, oof),
-        "cv_mse": mean_squared_error(y, oof),
-        "cv_rmse": np.sqrt(mean_squared_error(y, oof)),
-        "in_sample_r2": r2_score(y, ins),
-        "in_sample_mse": mean_squared_error(y, ins),
-    }
+  folds <- group_kfold(df$player_name)
+  oof <- numeric(nrow(df))
+  for (i in seq_len(N_SPLITS)) {
+    te <- folds == i
+    fit <- lm(fml, data = df[!te, ])
+    oof[te] <- predict(fit, newdata = df[te, ])
+  }
+  ins <- predict(lm(fml, data = df))
+  y <- df[[target]]
 
-results = pd.DataFrame([
-    evaluate(stuff1, BASELINE, use_stuff=False),
-    evaluate(stuff1, "M1 linear -> Stuff+"),
-    evaluate(stuff2, "M2 spline -> Stuff+"),
-]).set_index("model")
+  tibble(model = label,
+         cv_r2 = r2(y, oof), cv_mse = mean((y - oof)^2),
+         cv_rmse = sqrt(mean((y - oof)^2)),
+         in_sample_r2 = r2(y, ins), in_sample_mse = mean((y - ins)^2))
+}
 
-print("target: cumulative run value")
-print(results.round(4).to_string())
+results <- bind_rows(
+  evaluate(stuff1, BASELINE, use_stuff = FALSE),
+  evaluate(stuff1, "M1 linear -> Stuff+"),
+  evaluate(stuff2, "M2 spline -> Stuff+")
+)
+cat("target: cumulative run value\n")
+print(as.data.frame(results |> mutate(across(where(is.numeric), ~ round(.x, 4)))))
 ```
 
-```{python}
-#| label: py-eval-rate
+```{r}
+#| label: eval-rate
 # Secondary view on the rate scale, where exposure is already divided out.
-results_rate = pd.DataFrame([
-    evaluate(stuff1, "baseline (pitch type)", use_stuff=False, target="rv_per_100"),
-    evaluate(stuff1, "M1 linear -> Stuff+", target="rv_per_100"),
-    evaluate(stuff2, "M2 spline -> Stuff+", target="rv_per_100"),
-]).set_index("model")
-
-print("target: run value per 100 pitches")
-print(results_rate.round(4).to_string())
+results_rate <- bind_rows(
+  evaluate(stuff1, BASELINE, use_stuff = FALSE, target = "rv_per_100"),
+  evaluate(stuff1, "M1 linear -> Stuff+", target = "rv_per_100"),
+  evaluate(stuff2, "M2 spline -> Stuff+", target = "rv_per_100")
+)
+cat("target: run value per 100 pitches\n")
+print(as.data.frame(results_rate |> mutate(across(where(is.numeric), ~ round(.x, 4)))))
 ```
 
-```{python}
-#| label: py-select
+```{r}
+#| label: select
 # For a fixed target, R^2 = 1 - MSE / Var(y). The two criteria are monotone
 # transforms of one another and therefore always produce the same ranking --
 # reporting both is still worthwhile because MSE is on the scale of runs^2 and
 # says how large the errors actually are, but it cannot break a tie. The real
 # question is whether the leader's margin justifies the extra parameters.
-candidates = results.drop(index=BASELINE)
-ranked = candidates.sort_values("cv_r2", ascending=False)
-print(ranked[["cv_r2", "cv_mse", "cv_rmse"]].round(4).to_string())
-assert ranked.index[0] == candidates.cv_mse.idxmin(), "R^2 and MSE must agree"
+candidates <- results |> filter(model != BASELINE) |> arrange(desc(cv_r2))
+print(as.data.frame(candidates |> select(model, cv_r2, cv_mse, cv_rmse) |>
+                      mutate(across(where(is.numeric), ~ round(.x, 4)))))
+stopifnot(candidates$model[1] == results |> filter(model != BASELINE) |>
+            slice_min(cv_mse, n = 1) |> pull(model))
 
-PARSIMONY_TOL = 0.005
-leader = ranked.index[0]
-margin = float(ranked.cv_r2.iloc[0] - ranked.cv_r2.iloc[1])
+PARSIMONY_TOL <- 0.005
+leader <- candidates$model[1]
+margin <- candidates$cv_r2[1] - candidates$cv_r2[2]
 
-if leader.startswith("M2") and margin < PARSIMONY_TOL:
-    SELECTED = ranked.index[1]
-    print(f"\n{leader} leads by only {margin:.4f} R^2, inside the "
-          f"{PARSIMONY_TOL} tolerance -- keeping the simpler linear model.")
-else:
-    SELECTED = leader
-    print(f"\n{leader} leads by {margin:.4f} R^2.")
+if (startsWith(leader, "M2") && margin < PARSIMONY_TOL) {
+  SELECTED <- candidates$model[2]
+  cat(sprintf("\n%s leads by only %.4f R^2, inside the %.3f tolerance -- keeping the simpler linear model.\n",
+              leader, margin, PARSIMONY_TOL))
+} else {
+  SELECTED <- leader
+  cat(sprintf("\n%s leads by %.4f R^2.\n", leader, margin))
+}
+cat("SELECTED:", SELECTED, "\n")
 
-print(f"SELECTED: {SELECTED}")
-print(f"LOO preference (whiff fit, for reference): {comparison.index[0]}")
+if (LOO_TRUSTWORTHY) {
+  cat("LOO preference (whiff fit, for reference):", rownames(comparison)[1], "\n")
+} else {
+  cat("LOO withheld: unreliable for",
+      paste(names(LOO_RELIABLE)[!LOO_RELIABLE], collapse = ", "),
+      "(see the Pareto-k check)\n")
+}
 
-best_stuff = stuff1 if SELECTED.startswith("M1") else stuff2
-gain = candidates.loc[SELECTED, "cv_r2"] - results.loc[BASELINE, "cv_r2"]
-print(f"incremental out-of-sample R^2 from Stuff+: {gain:+.4f}  "
-      f"(baseline {results.loc[BASELINE, 'cv_r2']:.4f} -> "
-      f"{candidates.loc[SELECTED, 'cv_r2']:.4f})")
+best_stuff <- if (startsWith(SELECTED, "M1")) stuff1 else stuff2
+gain <- candidates$cv_r2[candidates$model == SELECTED] -
+  results$cv_r2[results$model == BASELINE]
+cat(sprintf("incremental out-of-sample R^2 from Stuff+: %+.4f (baseline %.4f -> %.4f)\n",
+            gain, results$cv_r2[results$model == BASELINE],
+            candidates$cv_r2[candidates$model == SELECTED]))
 ```
 
-```{python}
-#| label: py-eval-plot
-fig, ax = plt.subplots(figsize=(6.5, 5))
-sc = ax.scatter(best_stuff.stuff_plus, best_stuff.rv_per_100,
-                c=best_stuff.n_pitches, s=14, alpha=0.6, cmap="viridis",
-                norm=plt.matplotlib.colors.LogNorm())
-b = np.polyfit(best_stuff.stuff_plus, best_stuff.rv_per_100, 1)
-xs = np.linspace(best_stuff.stuff_plus.min(), best_stuff.stuff_plus.max(), 50)
-ax.plot(xs, np.polyval(b, xs), color="crimson", lw=2)
-ax.axhline(0, color="k", lw=0.8); ax.axvline(100, color="k", lw=0.8, ls=":")
-plt.colorbar(sc, label="pitches thrown")
-ax.set_xlabel("Stuff+"); ax.set_ylabel("run value per 100 pitches")
-ax.set_title(f"Stuff+ vs run value — {SELECTED}")
-r = np.corrcoef(best_stuff.stuff_plus, best_stuff.rv_per_100)[0, 1]
-ax.annotate(f"r = {r:.3f}", xy=(0.04, 0.06), xycoords="axes fraction")
-plt.tight_layout()
-plt.show()
+```{r}
+#| label: eval-plot
+ggplot(best_stuff, aes(stuff_plus, rv_per_100)) +
+  geom_point(aes(color = n_pitches), alpha = 0.6, size = 1.2) +
+  scale_color_viridis_c(trans = "log10", name = "pitches") +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE, color = "crimson") +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  geom_vline(xintercept = 100, linetype = "dotted", linewidth = 0.3) +
+  annotate("text", x = -Inf, y = -Inf, hjust = -0.2, vjust = -1,
+           label = sprintf("r = %.3f",
+                           cor(best_stuff$stuff_plus, best_stuff$rv_per_100))) +
+  labs(x = "Stuff+", y = "run value per 100 pitches",
+       title = paste("Stuff+ vs run value —", SELECTED)) +
+  theme_minimal()
 ```
 
-```{python}
-#| label: py-export
-out_cols = [
-    "player_name", "pitch_name", "n_pitches", "n_swings", "n_whiffs",
-    "whiff_rate", "run_value", "rv_per_100",
-    "stuff_plus", "stuff_plus_sd", "stuff_plus_lo", "stuff_plus_hi",
-]
-best_stuff.sort_values(["pitch_name", "stuff_plus"], ascending=[True, False]) \
-    [out_cols].to_csv("data/stuff_plus.csv", index=False)
+```{r}
+#| label: export
+out_cols <- c("player_name", "pitch_name", "n_pitches", "n_swings", "n_whiffs",
+              "whiff_rate", "run_value", "rv_per_100",
+              "stuff_plus", "stuff_plus_sd", "stuff_plus_lo", "stuff_plus_hi")
 
-pd.concat({"cumulative_run_value": results, "run_value_per_100": results_rate}) \
-    .to_csv("data/model_selection.csv")
+best_stuff |>
+  arrange(pitch_name, desc(stuff_plus)) |>
+  select(all_of(out_cols)) |>
+  write_csv(file.path(DATA_DIR, "stuff_plus.csv"))
 
-print("wrote data/stuff_plus.csv and data/model_selection.csv")
-print(f"selected model: {SELECTED}")
+bind_rows(
+  results      |> mutate(target = "cumulative_run_value"),
+  results_rate |> mutate(target = "run_value_per_100")
+) |>
+  relocate(target) |>
+  write_csv(file.path(DATA_DIR, "model_selection.csv"))
+
+cat("wrote", file.path(DATA_DIR, "stuff_plus.csv"), "and",
+    file.path(DATA_DIR, "model_selection.csv"), "\n")
+cat("selected model:", SELECTED, "\n")
 ```
 
 # Summary
@@ -1201,10 +1214,11 @@ print(f"selected model: {SELECTED}")
 | Stage | Result |
 |---|---|
 | Missing data | `arm_angle` is absent for some pitchers entirely; incomplete rows dropped explicitly before standardizing |
-| Collinearity | VIF pruning at threshold 5 — `arm_angle` is near-deterministic in release position |
-| Overdispersion | Beta-binomial over binomial, `kappa` estimated |
-| Hierarchy | Varying intercept + slopes by `pitch_name`; each type gets its own posterior |
-| Linearity | Tested by binned residuals + weighted curvature tests; splines fitted where it fails |
-| MCMC | $\hat{R}$, ESS bulk/tail, divergences, tree depth, E-BFMI, energy plot, PPC |
+| Collinearity | VIF measured *within* pitch type (the varying intercept absorbs between-type differences), pruned at 5 |
+| Overdispersion | `beta_binomial()` over `binomial()`, `phi` estimated |
+| Hierarchy | Varying intercept + uncorrelated varying slopes by `pitch_name`; each type gets its own posterior |
+| Linearity | Binned residuals + weighted curvature tests + global RESET; penalized `s()` smooths on the terms that fail |
+| MCMC | $\hat{R}$, ESS bulk/tail, divergences, tree depth, E-BFMI, energy plot, PPC on count and rate scales |
+| Fit comparison | LOO, gated on a Pareto-$k$ reliability check and withheld when PSIS degenerates |
 | Stuff+ | Draw-wise z-score against the pitch type's own posterior, 100 ± 10 |
 | Selection | Grouped 5-fold CV $R^2$ / MSE on cumulative run value, with exposure in the baseline |
